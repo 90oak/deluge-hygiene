@@ -1,5 +1,5 @@
 # deluge-hygiene
-Scripts to keep deluge server tidy
+Scripts to keep deluge server tidy. Remove torrents that are too big for available disk space.
 
 For sh script:
 
