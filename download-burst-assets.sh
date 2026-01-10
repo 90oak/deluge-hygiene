@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="90oak/vibe-codex"
+REPO="90oak/deluge-hygiene"
 BRANCH="main"
 
 BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
