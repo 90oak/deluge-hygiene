@@ -9,6 +9,7 @@ COMMITS_URL="https://api.github.com/repos/${REPO}/commits"
 FILES=(
   "burst_provision_local.sh"
   "burst_teardown_local.sh"
+  "deluge-hygiene-cron.sh"
   "remove_oversized_torrents.py"
 )
 
@@ -72,28 +73,37 @@ get_local_epoch() {
 
 for file in "${FILES[@]}"; do
   url="${BASE_URL}/${file}"
+  target_path="${file}"
+  download_path="${file}"
+  if [[ "${file}" == "deluge-hygiene-cron.sh" ]]; then
+    target_path="/usr/local/sbin/${file}"
+    download_path="${file}"
+  fi
   echo "Checking ${url}"
   downloaded=false
   if ! remote_epoch=$(get_remote_epoch "${file}"); then
     echo "WARN: GitHub commit lookup failed for ${file}; downloading latest copy."
-    curl -fsSL "${url}" -o "${file}"
+    curl -fsSL "${url}" -o "${download_path}"
     downloaded=true
   fi
-  if [[ -f "${file}" ]]; then
-    local_epoch=$(get_local_epoch "${file}")
+  if [[ -f "${target_path}" ]]; then
+    local_epoch=$(get_local_epoch "${target_path}")
     if [[ -n "${remote_epoch:-}" && "${remote_epoch}" -gt "${local_epoch}" ]]; then
-      curl -fsSL "${url}" -o "${file}"
+      curl -fsSL "${url}" -o "${download_path}"
       downloaded=true
     fi
   else
     if [[ "${downloaded}" != "true" ]]; then
-      curl -fsSL "${url}" -o "${file}"
+      curl -fsSL "${url}" -o "${download_path}"
       downloaded=true
     fi
   fi
 
   if [[ "${downloaded}" == "true" ]]; then
-    chmod 755 "${file}"
+    if [[ "${file}" == "deluge-hygiene-cron.sh" ]]; then
+      mv "${download_path}" "${target_path}"
+    fi
+    chmod 755 "${target_path}"
     downloaded_count=$((downloaded_count + 1))
     if [[ "${file}" == "remove_oversized_torrents.py" ]]; then
       updated_remove_oversized=true
