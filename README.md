@@ -17,7 +17,10 @@ sudo cp -r deluge-client-1.9.0/deluge_client /usr/local/lib/python3.11/dist-pack
 python3 -c "import deluge_client; print(deluge_client.__file__)"
 ```
 Verify output is `/usr/local/lib/python3.11/dist-packages/deluge_client/__init__.py`
+
+Go to GitHub → Settings → Developer Settings → Personal access tokens → Fine‑grained tokens. 
 ```
+export GITHUB_TOKEN="ghp_...your_token_here..."
 rm -rf deluge-client-1.9.0 deluge-client-1.9.0.tar.gz
 python3 remove_oversized_torrents.py
 curl -fL -o download-burst-assets.sh https://raw.githubusercontent.com/90oak/deluge-hygiene/refs/heads/main/deluge-hygiene-cron.sh
