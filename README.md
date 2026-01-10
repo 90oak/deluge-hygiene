@@ -26,7 +26,7 @@ chmod 755 download-burst-assets.sh
 apt install cron
 crontab -e
 ```
-Add `0 * * * * /usr/local/sbin/deluge-hygiene-cron.sh` at bottom of file to run script hourly, save, exit.
+Add `0 * * * * /usr/local/sbin/deluge-hygiene-cron.sh` at bottom of file to run script hourly, save, exit. (Don't forget to update the deluge user ID and password in the Python script.)
 ```
 crontab -l
 sudo systemctl status cron
