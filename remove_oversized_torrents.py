@@ -4,8 +4,8 @@ from deluge_client import DelugeRPCClient  # ✅ Correct import
 # Deluge connection settings
 DELUGE_HOST = "127.0.0.1"
 DELUGE_PORT = 58846
-DELUGE_USER = "yourdelugeID"
-DELUGE_PASS = "yourdelugepassword"
+DELUGE_USER = "yourusername"
+DELUGE_PASS = "yourpassword"
 
 # Path to Deluge's download directory
 DOWNLOAD_PATH = "/var/lib/deluged/Downloads"
@@ -22,26 +22,54 @@ def main():
     # ✅ Connect to Deluge
     client.connect()
 
-    # ✅ Get all torrents
-    torrents = client.call("core.get_torrents_status", {}, ["name", "total_size", "progress"])
-    #Debug
-    #print("Received data from Deluge:")
-    #print(torrents)  # ✅ Add this to debug
+    # ✅ Get all torrents (both downloading and seeding)
+    torrents = client.call(
+        "core.get_torrents_status", {}, ["name", "total_size", "progress", "files"]
+    )
 
     # ✅ Get available disk space
     available_space = get_available_space(DOWNLOAD_PATH)
     print(f"Available disk space: {available_space / (1024**3):.2f} GB")
 
-
-
-
     for torrent_id, data in torrents.items():
-        torrent_id = torrent_id.decode("utf-8")  # Decode torrent ID
-        data = {k.decode("utf-8"): v.decode("utf-8") if isinstance(v, bytes) else v for k, v in data.items()}  # Decode keys and values
+        torrent_id = torrent_id.decode("utf-8") if isinstance(torrent_id, bytes) else torrent_id
+        data = {
+            (k.decode("utf-8") if isinstance(k, bytes) else k): (
+                v.decode("utf-8") if isinstance(v, bytes) else v
+            )
+            for k, v in data.items()
+        }
     
         name = data["name"]  # Now this should work fine
         total_size = data["total_size"]
         progress = data["progress"]
+        files = data.get("files", [])
+
+        has_blocked_extension = False
+        for file_info in files:
+            # Normalize nested file data
+            normalized = {
+                (k.decode("utf-8") if isinstance(k, bytes) else k): (
+                    v.decode("utf-8") if isinstance(v, bytes) else v
+                )
+                for k, v in file_info.items()
+            }
+
+            file_path = normalized.get("path", "")
+            if isinstance(file_path, bytes):
+                file_path = file_path.decode("utf-8")
+
+            if file_path.lower().endswith((".scr", ".rar", ".exe")):
+                has_blocked_extension = True
+                break
+
+        if has_blocked_extension:
+            print(
+                f"🚨 Removing torrent: {name} (ID: {torrent_id}) - Contains .scr, .rar, or .exe file!"
+            )
+            client.call("core.remove_torrent", torrent_id, True)  # True = remove data
+            continue
+
         #debug
         print(f"Processing torrent: {torrent_id}")
         print(f"Data: {data}")  # ✅ Add this to inspect structure
