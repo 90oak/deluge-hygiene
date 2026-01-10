@@ -20,7 +20,7 @@ Verify output is `/usr/local/lib/python3.11/dist-packages/deluge_client/__init__
 ```
 rm -rf deluge-client-1.9.0 deluge-client-1.9.0.tar.gz
 python3 remove_oversized_torrents.py
-curl -fL -o download-burst-assets.sh <DOWNLOAD_BURST_ASSETS_URL>
+curl -fL -o download-burst-assets.sh https://raw.githubusercontent.com/90oak/deluge-hygiene/refs/heads/main/deluge-hygiene-cron.sh
 chmod 755 download-burst-assets.sh
 ./download-burst-assets.sh
 apt install cron
