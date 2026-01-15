@@ -59,13 +59,13 @@ def main():
             if isinstance(file_path, bytes):
                 file_path = file_path.decode("utf-8")
 
-            if file_path.lower().endswith((".scr", ".rar", ".exe")):
+            if file_path.lower().endswith((".scr", ".rar", ".exe", ".arj")):
                 has_blocked_extension = True
                 break
 
         if has_blocked_extension:
             print(
-                f"🚨 Removing torrent: {name} (ID: {torrent_id}) - Contains .scr, .rar, or .exe file!"
+                f"🚨 Removing torrent: {name} (ID: {torrent_id}) - Contains .scr, .rar, .exe, or .arj file!"
             )
             client.call("core.remove_torrent", torrent_id, True)  # True = remove data
             continue
