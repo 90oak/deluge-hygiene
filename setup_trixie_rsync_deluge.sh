@@ -71,7 +71,6 @@ ensure_ltconfig_plugin() {
   apt-get install -y --no-install-recommends \
     ca-certificates \
     python3 \
-    python3-distutils \
     python3-setuptools \
     unzip \
     wget
@@ -84,7 +83,7 @@ ensure_ltconfig_plugin() {
       "https://github.com/ratanakvlun/deluge-ltconfig/archive/refs/tags/v2.0.0.zip"
     unzip -q ltconfig.zip
     cd deluge-ltconfig-2.0.0
-    python3 setup.py bdist_egg
+    SETUPTOOLS_USE_DISTUTILS=local python3 setup.py bdist_egg
     install -d -m 755 "${plugin_dir}"
     install -m 644 dist/*.egg "${plugin_dir}/"
   )
