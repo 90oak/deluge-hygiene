@@ -53,8 +53,11 @@ install_packages() {
     deluged \
     deluge-web \
     deluge-console \
-    deluge-ltconfig \
     rsync
+
+  if ! apt-get install -y --no-install-recommends deluge-ltconfig; then
+    echo "deluge-ltconfig package not available; will build plugin from source." >&2
+  fi
 }
 
 ensure_ltconfig_plugin() {
