@@ -87,7 +87,7 @@ ensure_ltconfig_plugin() {
     install -d -m 755 "${plugin_dir}"
     install -m 644 dist/*.egg "${plugin_dir}/"
   )
-  chown debian-deluged:debian-deluged "${plugin_dir}"/ltconfig*.egg
+  chown debian-deluged:debian-deluged "${plugin_dir}"/ltConfig*.egg
   rm -rf "${tmp_dir}"
 }
 
