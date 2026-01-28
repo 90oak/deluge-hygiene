@@ -58,20 +58,34 @@ install_packages() {
 }
 
 ensure_ltconfig_plugin() {
-  local plugin_dir="/usr/lib/python3/dist-packages/deluge/plugins"
+  local plugin_dir="${DELUGE_CONFIG_DIR}/plugins"
 
   if ls "${plugin_dir}/ltconfig"*.egg >/dev/null 2>&1; then
     return 0
   fi
 
-  echo "ltconfig plugin not found via packages; downloading upstream release." >&2
-  apt-get install -y --no-install-recommends curl
+  echo "ltconfig plugin not found; building from source." >&2
+  apt-get install -y --no-install-recommends \
+    ca-certificates \
+    python3 \
+    python3-distutils \
+    python3-setuptools \
+    unzip \
+    wget
 
   local tmp_dir
   tmp_dir=$(mktemp -d)
-  curl -fsSL -o "${tmp_dir}/ltconfig.egg" \
-    "https://github.com/JohnDoee/deluge-ltconfig/releases/latest/download/ltconfig.egg"
-  install -m 644 "${tmp_dir}/ltconfig.egg" "${plugin_dir}/ltconfig.egg"
+  (
+    cd "${tmp_dir}"
+    wget -O ltconfig.zip \
+      "https://github.com/ratanakvlun/deluge-ltconfig/archive/refs/tags/v2.0.0.zip"
+    unzip -q ltconfig.zip
+    cd deluge-ltconfig-2.0.0
+    python3 setup.py bdist_egg
+    install -d -m 755 "${plugin_dir}"
+    install -m 644 dist/*.egg "${plugin_dir}/"
+  )
+  chown debian-deluged:debian-deluged "${plugin_dir}"/ltconfig*.egg
   rm -rf "${tmp_dir}"
 }
 
