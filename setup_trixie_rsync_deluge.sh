@@ -180,19 +180,18 @@ configure_deluge() {
     exit 1
   fi
 
-  sudo -u debian-deluged deluge-console -c "${DELUGE_CONFIG_DIR}" <<DELUGECONF
-config -s download_location "${DOWNLOAD_DIR}"
-config -s move_completed true
-config -s move_completed_path "${FINISHED_DIR}"
-config -s listen_interface "${TAILSCALE_IP}"
-config -s listen_interface_ipv6 ""
-plugin -e Label
-plugin -e ltconfig
-label add books
-label set books move_completed True
-label set books move_completed_path "${BOOKS_DIR}"
-exit
-DELUGECONF
+  sudo -u debian-deluged deluge-console -c "${DELUGE_CONFIG_DIR}" \
+    "connect 127.0.0.1:58846" \
+    "config -s download_location \"${DOWNLOAD_DIR}\"" \
+    "config -s move_completed true" \
+    "config -s move_completed_path \"${FINISHED_DIR}\"" \
+    "config -s listen_interface \"${TAILSCALE_IP}\"" \
+    "config -s listen_interface_ipv6 \"\"" \
+    "plugin -e Label" \
+    "plugin -e ltconfig" \
+    "label add books" \
+    "label set books move_completed True" \
+    "label set books move_completed_path \"${BOOKS_DIR}\""
 
   systemctl restart deluged
 
