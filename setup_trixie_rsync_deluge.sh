@@ -114,7 +114,7 @@ configure_journald() {
   install -d /etc/systemd/journald.conf.d
   cat > /etc/systemd/journald.conf.d/99-limit.conf <<'JCONF'
 [Journal]
-SystemMaxFileSize=50M
+SystemMaxFileSize=1M
 JCONF
   systemctl restart systemd-journald
 }
@@ -126,7 +126,7 @@ configure_btmp_rotation() {
     monthly
     create 0600 root utmp
     rotate 1
-    size 10M
+    size 1M
 }
 BTMP
 }
