@@ -161,13 +161,40 @@ DELUGED
 wait_for_deluge() {
   local attempts=30
   while (( attempts > 0 )); do
-    if sudo -u debian-deluged deluge-console -c "${DELUGE_CONFIG_DIR}" info >/dev/null 2>&1; then
-      return 0
+    if auth_line=$(get_deluge_auth 2>/dev/null); then
+      local deluge_user deluge_pass
+      read -r deluge_user deluge_pass <<<"${auth_line}"
+      if sudo -u debian-deluged deluge-console -c "${DELUGE_CONFIG_DIR}" \
+        "connect 127.0.0.1:58846 ${deluge_user} ${deluge_pass}; info" \
+        >/dev/null 2>&1; then
+        return 0
+      fi
     fi
     sleep 1
     attempts=$((attempts - 1))
   done
   return 1
+}
+
+get_deluge_auth() {
+  local auth_file="${DELUGE_CONFIG_DIR}/auth"
+  if [[ ! -f "${auth_file}" ]]; then
+    return 1
+  fi
+
+  local entry
+  entry=$(awk -F: '$1 == "localclient" { print $1 ":" $2; exit }' "${auth_file}")
+  if [[ -z "${entry}" ]]; then
+    return 1
+  fi
+
+  local deluge_user deluge_pass
+  IFS=: read -r deluge_user deluge_pass <<<"${entry}"
+  if [[ -z "${deluge_user}" || -z "${deluge_pass}" ]]; then
+    return 1
+  fi
+
+  printf '%s %s\n' "${deluge_user}" "${deluge_pass}"
 }
 
 deluge_console_cmd() {
@@ -192,12 +219,15 @@ configure_deluge() {
     exit 1
   fi
 
-  deluge_console_cmd "connect 127.0.0.1:58846; config -s download_location \"${DOWNLOAD_DIR}\""
-  deluge_console_cmd "connect 127.0.0.1:58846; config -s move_completed true"
-  deluge_console_cmd "connect 127.0.0.1:58846; config -s move_completed_path \"${FINISHED_DIR}\""
-  deluge_console_cmd "connect 127.0.0.1:58846; config -s listen_interface \"${TAILSCALE_IP}\""
+  local deluge_user deluge_pass
+  read -r deluge_user deluge_pass <<<"$(get_deluge_auth)"
 
-  if deluge_console_cmd "connect 127.0.0.1:58846; config -l" | grep -q "^listen_interface_ipv6"; then
+  deluge_console_cmd "connect 127.0.0.1:58846 ${deluge_user} ${deluge_pass}; config -s download_location \"${DOWNLOAD_DIR}\""
+  deluge_console_cmd "connect 127.0.0.1:58846 ${deluge_user} ${deluge_pass}; config -s move_completed true"
+  deluge_console_cmd "connect 127.0.0.1:58846 ${deluge_user} ${deluge_pass}; config -s move_completed_path \"${FINISHED_DIR}\""
+  deluge_console_cmd "connect 127.0.0.1:58846 ${deluge_user} ${deluge_pass}; config -s listen_interface \"${TAILSCALE_IP}\""
+
+  if deluge_console_cmd "connect 127.0.0.1:58846 ${deluge_user} ${deluge_pass}; config -l" | grep -q "^listen_interface_ipv6"; then
     echo "Detected listen_interface_ipv6 in Deluge config; leaving existing value unchanged."
   fi
 
@@ -210,13 +240,14 @@ configure_deluge() {
   if [[ -f "${DELUGE_CONFIG_DIR}/web.conf" ]]; then
     python3 - <<PY
 import json
+from json import JSONDecoder
 from pathlib import Path
+
 path = Path("${DELUGE_CONFIG_DIR}/web.conf")
-with path.open() as f:
-    data = json.load(f)
+raw = path.read_text().strip()
+data, _ = JSONDecoder().raw_decode(raw)
 data["interface"] = "${TAILSCALE_IP}"
-with path.open("w") as f:
-    json.dump(data, f, indent=2, sort_keys=True)
+path.write_text(json.dumps(data, indent=2, sort_keys=True))
 PY
   else
     echo "deluge-web configuration not found at ${DELUGE_CONFIG_DIR}/web.conf" >&2
