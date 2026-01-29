@@ -410,12 +410,25 @@ try:
 except FileNotFoundError:
     raw = None
 
+header = None
+data = None
+
 if raw is not None:
+    # Try normal JSON first
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        print(f"Invalid JSON in {path}: {exc}", file=sys.stderr)
-        sys.exit(1)
+    except json.JSONDecodeError:
+        # Try Deluge "two JSON objects" format: {header}\n{body}
+        dec = json.JSONDecoder()
+        try:
+            header, idx = dec.raw_decode(raw)
+            while idx < len(raw) and raw[idx].isspace():
+                idx += 1
+            data, _ = dec.raw_decode(raw, idx)
+        except json.JSONDecodeError as exc:
+            print(f"Invalid JSON in {path}: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     stat = os.stat(path)
     mode = stat.st_mode & 0o777
     uid = stat.st_uid
@@ -431,14 +444,20 @@ ${python_snippet}
 directory = os.path.dirname(path) or "."
 fd, tmp_path = tempfile.mkstemp(dir=directory)
 with os.fdopen(fd, "w", encoding="utf-8") as handle:
-    json.dump(data, handle, indent=2, sort_keys=True)
-    handle.write("\\n")
+    if header is not None and isinstance(header, dict):
+        handle.write(json.dumps(header, sort_keys=True))
+        handle.write("\\n")
+        handle.write(json.dumps(data, sort_keys=True))
+        handle.write("\\n")
+    else:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\\n")
+
 os.chmod(tmp_path, mode)
 os.chown(tmp_path, uid, gid)
 os.replace(tmp_path, path)
 PY
 }
-
 update_deluge_core_conf_atomic() {
   local path=$1
   local python_snippet=$2
