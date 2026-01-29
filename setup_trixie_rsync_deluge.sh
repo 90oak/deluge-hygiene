@@ -200,55 +200,356 @@ get_deluge_auth() {
 deluge_console_cmd() {
   local cmd=$1
   local console_base=(sudo -u debian-deluged deluge-console -c "${DELUGE_CONFIG_DIR}")
+  local stderr_file
+  stderr_file=$(mktemp)
 
   if "${console_base[@]}" --help 2>&1 | grep -q -- "--command"; then
-    "${console_base[@]}" --command "${cmd}"
+    "${console_base[@]}" --command "${cmd}" 2>"${stderr_file}"
   else
-    "${console_base[@]}" "${cmd}"
+    "${console_base[@]}" "${cmd}" 2>"${stderr_file}"
   fi
+  local exit_code=$?
+
+  if [[ ${exit_code} -eq 0 ]]; then
+    grep -v -E "AttributeError: 'ConsoleUI' object has no attribute 'started_deferred'|Unhandled error in Deferred|/usr/lib/python3/dist-packages/deluge/ui/console/main.py:367" "${stderr_file}" >&2 || true
+  else
+    cat "${stderr_file}" >&2
+  fi
+  rm -f "${stderr_file}"
+  return "${exit_code}"
+}
+
+detect_global_ipv6() {
+  local ipv6
+  ipv6=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | sed -n 's/.* src \([^ ]*\).*/\1/p' | head -n1 | tr -d '[:space:]')
+  if [[ -z ${ipv6} ]]; then
+    ipv6=$(ip -6 addr show scope global | awk '/inet6/ && $2 !~ /^fe80/ && $0 !~ /temporary/ {sub(/\/.*/,"",$2); print $2; exit}')
+  fi
+  printf '%s\n' "${ipv6}"
+}
+
+detect_plugin_ids() {
+  local plugin_dir="${DELUGE_CONFIG_DIR}/plugins"
+  local egg_files=()
+  local egg
+  for egg in "${plugin_dir}"/*.egg; do
+    if [[ -f ${egg} ]]; then
+      egg_files+=("${egg}")
+    fi
+  done
+
+  local plugin_info
+  plugin_info=$(python3 - "${egg_files[@]}" <<'PY'
+import configparser
+import json
+import os
+import sys
+import zipfile
+
+eggs = sys.argv[1:]
+result = {
+    "label_id": "",
+    "label_egg": "",
+    "ltconfig_id": "",
+    "ltconfig_egg": "",
+}
+
+def ids_from_egg(path):
+    ids = []
+    try:
+        with zipfile.ZipFile(path) as zf:
+            for candidate in ("EGG-INFO/entry_points.txt", "entry_points.txt"):
+                if candidate in zf.namelist():
+                    raw = zf.read(candidate).decode("utf-8")
+                    parser = configparser.ConfigParser()
+                    parser.optionxform = str
+                    parser.read_string(raw)
+                    if parser.has_section("deluge.plugin"):
+                        ids.extend(parser.options("deluge.plugin"))
+                    break
+    except Exception:
+        ids = []
+    if not ids:
+        base = os.path.basename(path)
+        if base.lower().endswith(".egg"):
+            base = base[:-4]
+        ids = [base.split("-")[0]]
+    return ids
+
+def ids_from_dir(path):
+    ids = []
+    if not os.path.isdir(path):
+        return ids
+    for entry in os.listdir(path):
+        if entry.startswith("__"):
+            continue
+        full = os.path.join(path, entry)
+        if os.path.isdir(full):
+            ids.append(entry)
+        elif entry.lower().endswith(".egg"):
+            ids.extend(ids_from_egg(full))
+    return ids
+
+for egg in eggs:
+    for plugin_id in ids_from_egg(egg):
+        lower_id = plugin_id.lower()
+        if "label" in lower_id and not result["label_id"]:
+            result["label_id"] = plugin_id
+            result["label_egg"] = os.path.basename(egg)
+        if "ltconfig" in lower_id and not result["ltconfig_id"]:
+            result["ltconfig_id"] = plugin_id
+            result["ltconfig_egg"] = os.path.basename(egg)
+
+for plugin_dir in (
+    "/usr/lib/python3/dist-packages/deluge/plugins",
+    "/usr/share/deluge/plugins",
+    "/usr/lib/deluge/plugins",
+):
+    for plugin_id in ids_from_dir(plugin_dir):
+        lower_id = plugin_id.lower()
+        if "label" in lower_id and not result["label_id"]:
+            result["label_id"] = plugin_id
+            result["label_egg"] = plugin_dir
+        if "ltconfig" in lower_id and not result["ltconfig_id"]:
+            result["ltconfig_id"] = plugin_id
+            result["ltconfig_egg"] = plugin_dir
+
+print(json.dumps(result))
+PY
+)
+
+  local label_plugin_id ltconfig_plugin_id label_plugin_egg ltconfig_plugin_egg
+  label_plugin_id=$(python3 - <<PY
+import json
+print(json.loads('''${plugin_info}''')["label_id"])
+PY
+)
+  ltconfig_plugin_id=$(python3 - <<PY
+import json
+print(json.loads('''${plugin_info}''')["ltconfig_id"])
+PY
+)
+  label_plugin_egg=$(python3 - <<PY
+import json
+print(json.loads('''${plugin_info}''')["label_egg"])
+PY
+)
+  ltconfig_plugin_egg=$(python3 - <<PY
+import json
+print(json.loads('''${plugin_info}''')["ltconfig_egg"])
+PY
+)
+
+  if [[ -z ${label_plugin_id} || -z ${ltconfig_plugin_id} ]]; then
+    echo "Unable to detect Label or ltconfig plugin IDs from ${DELUGE_CONFIG_DIR}/plugins." >&2
+    echo "Detected label plugin: ${label_plugin_id:-none} (${label_plugin_egg:-unknown}); ltconfig plugin: ${ltconfig_plugin_id:-none} (${ltconfig_plugin_egg:-unknown})." >&2
+    exit 1
+  fi
+
+  echo "Detected Label plugin ID: ${label_plugin_id} (egg: ${label_plugin_egg})." >&2
+  echo "Detected ltconfig plugin ID: ${ltconfig_plugin_id} (egg: ${ltconfig_plugin_egg})." >&2
+
+  printf '%s %s %s %s\n' "${label_plugin_id}" "${label_plugin_egg}" "${ltconfig_plugin_id}" "${ltconfig_plugin_egg}"
+}
+
+update_json_atomic() {
+  local path=$1
+  local python_snippet=$2
+  local uid_gid_mode=$3
+
+  python3 - <<PY
+import json
+import os
+import tempfile
+import sys
+
+path = "${path}"
+raw = None
+try:
+    raw = open(path, "r", encoding="utf-8").read()
+except FileNotFoundError:
+    raw = None
+
+if raw is not None:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"Invalid JSON in {path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    stat = os.stat(path)
+    mode = stat.st_mode & 0o777
+    uid = stat.st_uid
+    gid = stat.st_gid
+else:
+    data = {}
+    uid = int("${uid_gid_mode%%:*}")
+    gid = int("${uid_gid_mode#*:}")
+    mode = 0o600
+
+${python_snippet}
+
+directory = os.path.dirname(path) or "."
+fd, tmp_path = tempfile.mkstemp(dir=directory)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, indent=2, sort_keys=True)
+    handle.write("\\n")
+os.chmod(tmp_path, mode)
+os.chown(tmp_path, uid, gid)
+os.replace(tmp_path, path)
+PY
 }
 
 configure_deluge() {
   install -d -m 750 "${DELUGE_CONFIG_DIR}"
   chown -R debian-deluged:debian-deluged "${DELUGE_STATE_DIR}"
 
-  systemctl enable --now deluged
-
-  if ! wait_for_deluge; then
-    echo "deluged did not become ready." >&2
+  local global_ipv6
+  global_ipv6=$(detect_global_ipv6)
+  if [[ -z ${global_ipv6} ]]; then
+    echo "Unable to determine global IPv6 address." >&2
     exit 1
   fi
+  echo "Detected Tailscale IPv4: ${TAILSCALE_IP}"
+  echo "Detected global IPv6: ${global_ipv6}"
 
-  local deluge_user deluge_pass
-  read -r deluge_user deluge_pass <<<"$(get_deluge_auth)"
+  systemctl enable --now deluged
+  local core_conf="${DELUGE_CONFIG_DIR}/core.conf"
+  local attempts=30
+  while [[ ! -f ${core_conf} && ${attempts} -gt 0 ]]; do
+    sleep 1
+    attempts=$((attempts - 1))
+  done
+  if [[ ! -f ${core_conf} ]]; then
+    echo "core.conf was not created by deluged at ${core_conf}." >&2
+    exit 1
+  fi
+  systemctl stop deluged
 
-  deluge_console_cmd "connect 127.0.0.1:58846 ${deluge_user} ${deluge_pass}; config -s download_location \"${DOWNLOAD_DIR}\""
-  deluge_console_cmd "connect 127.0.0.1:58846 ${deluge_user} ${deluge_pass}; config -s move_completed true"
-  deluge_console_cmd "connect 127.0.0.1:58846 ${deluge_user} ${deluge_pass}; config -s move_completed_path \"${FINISHED_DIR}\""
-  deluge_console_cmd "connect 127.0.0.1:58846 ${deluge_user} ${deluge_pass}; config -s listen_interface \"${TAILSCALE_IP}\""
+  local label_plugin_id label_plugin_egg ltconfig_plugin_id ltconfig_plugin_egg
+  read -r label_plugin_id label_plugin_egg ltconfig_plugin_id ltconfig_plugin_egg <<<"$(detect_plugin_ids)"
 
-  if deluge_console_cmd "connect 127.0.0.1:58846 ${deluge_user} ${deluge_pass}; config -l" | grep -q "^listen_interface_ipv6"; then
-    echo "Detected listen_interface_ipv6 in Deluge config; leaving existing value unchanged."
+  local deluge_uid deluge_gid
+  deluge_uid=$(id -u debian-deluged)
+  deluge_gid=$(id -g debian-deluged)
+
+  update_json_atomic "${core_conf}" "
+data['download_location'] = '${DOWNLOAD_DIR}'
+data['move_completed'] = True
+data['move_completed_path'] = '${FINISHED_DIR}'
+data['listen_interface_ipv6'] = '${global_ipv6}'
+if data.get('listen_interface') == '${TAILSCALE_IP}':
+    data['listen_interface'] = ''
+enabled = data.get('enabled_plugins', [])
+if not isinstance(enabled, list):
+    raise SystemExit('enabled_plugins is not a list in core.conf')
+for plugin in ('${label_plugin_id}', '${ltconfig_plugin_id}'):
+    if plugin not in enabled:
+        enabled.append(plugin)
+data['enabled_plugins'] = enabled
+" "${deluge_uid}:${deluge_gid}"
+
+  local ltconfig_conf
+  ltconfig_conf=$(find "${DELUGE_CONFIG_DIR}" -maxdepth 1 -type f -iname '*ltconfig*' | sort | head -n1 || true)
+  if [[ -z ${ltconfig_conf} ]]; then
+    ltconfig_conf="${DELUGE_CONFIG_DIR}/ltconfig.conf"
   fi
 
-  systemctl restart deluged
+  local ltconfig_plugin_source="${ltconfig_plugin_egg}"
+  if [[ ${ltconfig_plugin_source} != /* ]]; then
+    ltconfig_plugin_source="${DELUGE_CONFIG_DIR}/plugins/${ltconfig_plugin_egg}"
+  fi
+
+  python3 - <<PY
+import ast
+import json
+import os
+import sys
+import tempfile
+import zipfile
+
+config_path = "${ltconfig_conf}"
+global_ipv6 = "${global_ipv6}"
+plugin_egg = "${ltconfig_plugin_source}"
+uid = int("${deluge_uid}")
+gid = int("${deluge_gid}")
+
+def load_json(path):
+    raw = open(path, "r", encoding="utf-8").read()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"ltconfig config {path} is not valid JSON: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+def extract_defaults(egg_path):
+    if not os.path.exists(egg_path):
+        return None
+    try:
+        with zipfile.ZipFile(egg_path) as zf:
+            for name in zf.namelist():
+                if not name.endswith(".py"):
+                    continue
+                text = zf.read(name).decode("utf-8", errors="ignore")
+                for key in ("DEFAULT_PREFS", "DEFAULT_CONFIG", "DEFAULT_SETTINGS"):
+                    if key in text:
+                        try:
+                            module = ast.parse(text, filename=name)
+                        except SyntaxError:
+                            continue
+                        for node in module.body:
+                            if isinstance(node, ast.Assign):
+                                for target in node.targets:
+                                    if isinstance(target, ast.Name) and target.id == key:
+                                        return ast.literal_eval(node.value)
+    except zipfile.BadZipFile:
+        return None
+    return None
+
+if os.path.exists(config_path):
+    data = load_json(config_path)
+    stat = os.stat(config_path)
+    mode = stat.st_mode & 0o777
+else:
+    data = extract_defaults(plugin_egg)
+    if data is None:
+        print(f"No ltconfig config found and unable to derive defaults from {plugin_egg}.", file=sys.stderr)
+        sys.exit(1)
+    mode = 0o600
+if not isinstance(data, dict):
+    print(f"ltconfig config {config_path} did not contain a JSON object.", file=sys.stderr)
+    sys.exit(1)
+
+target = data.get("settings")
+if isinstance(target, dict):
+    settings = target
+else:
+    settings = data
+
+settings["listen_interfaces"] = global_ipv6
+settings["outgoing_interfaces"] = global_ipv6
+settings["outgoing_interface"] = global_ipv6
+
+directory = os.path.dirname(config_path) or "."
+fd, tmp_path = tempfile.mkstemp(dir=directory)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, indent=2, sort_keys=True)
+    handle.write("\\n")
+os.chmod(tmp_path, mode)
+os.chown(tmp_path, uid, gid)
+os.replace(tmp_path, config_path)
+print(f"ltconfig config updated at {config_path}.")
+PY
+
+  systemctl start deluged
 
   systemctl enable --now deluge-web
   sleep 2
   systemctl stop deluge-web
 
   if [[ -f "${DELUGE_CONFIG_DIR}/web.conf" ]]; then
-    python3 - <<PY
-import json
-from json import JSONDecoder
-from pathlib import Path
-
-path = Path("${DELUGE_CONFIG_DIR}/web.conf")
-raw = path.read_text().strip()
-data, _ = JSONDecoder().raw_decode(raw)
-data["interface"] = "${TAILSCALE_IP}"
-path.write_text(json.dumps(data, indent=2, sort_keys=True))
-PY
+    update_json_atomic "${DELUGE_CONFIG_DIR}/web.conf" "
+data['interface'] = '${TAILSCALE_IP}'
+" "${deluge_uid}:${deluge_gid}"
   else
     echo "deluge-web configuration not found at ${DELUGE_CONFIG_DIR}/web.conf" >&2
     exit 1
