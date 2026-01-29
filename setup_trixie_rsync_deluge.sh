@@ -219,53 +219,88 @@ deluge_console_cmd() {
   return "${exit_code}"
 }
 
-detect_global_ipv6() {
-  local ipv6
-  ipv6=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | sed -n 's/.* src \([^ ]*\).*/\1/p' | head -n1 | tr -d '[:space:]')
-  if [[ -n ${ipv6} ]]; then
-    if python3 - <<PY
-import ipaddress
-import sys
-try:
-    addr = ipaddress.IPv6Address("${ipv6}")
-except ValueError:
-    sys.exit(1)
-if addr in ipaddress.IPv6Network("2000::/3"):
-    sys.exit(0)
-sys.exit(1)
-PY
-    then
-      printf '%s\n' "${ipv6}"
-      return 0
-    fi
+configure_systemd_networkd_prefixstable() {
+  if ! systemctl is-active --quiet systemd-networkd; then
+    return 0
   fi
 
- ipv6=$(ip -6 addr show scope global | python3 -c '
-import ipaddress, sys
-lines = sys.stdin.read().splitlines()
-preferred, temporary = [], []
+  local iface
+  iface=$(ip -4 route show default 2>/dev/null | awk '{print $5}' | head -n1)
+  if [[ -z ${iface} ]]; then
+    iface="ens2"
+  fi
+
+  local network_file="/etc/systemd/network/10-${iface}.network"
+
+  if [[ ! -f ${network_file} ]]; then
+    cat > "${network_file}" <<EOF
+[Match]
+Name=${iface}
+
+[Network]
+DHCP=yes
+IPv6AcceptRA=yes
+
+[IPv6AcceptRA]
+Token=prefixstable
+EOF
+    systemctl restart systemd-networkd
+    return 0
+  fi
+
+  python3 - <<PY
+import sys
+
+path = "${network_file}"
+lines = open(path, "r", encoding="utf-8").read().splitlines()
+
+out = []
+in_section = None
+token_written = False
+token_present = False
+section_found = False
+changed = False
+
+def flush_section_end():
+    global token_written, token_present, changed
+    if in_section == "IPv6AcceptRA" and not token_present:
+        out.append("Token=prefixstable")
+        token_written = True
+        changed = True
+
 for line in lines:
-    line = line.strip()
-    if not line.startswith("inet6 "):
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        flush_section_end()
+        section = stripped.strip("[]")
+        in_section = section
+        if section == "IPv6AcceptRA":
+            section_found = True
+        out.append(line)
         continue
-    parts = line.split()
-    ip = parts[1].split("/")[0]
-    try:
-        addr = ipaddress.IPv6Address(ip)
-    except ValueError:
+    if in_section == "IPv6AcceptRA" and stripped.startswith("Token="):
+        if stripped != "Token=prefixstable":
+            out.append("Token=prefixstable")
+            changed = True
+        else:
+            out.append(line)
+        token_present = True
         continue
-    if addr not in ipaddress.IPv6Network("2000::/3"):
-        continue
-    (temporary if "temporary" in parts else preferred).append(ip)
+    out.append(line)
 
-if preferred:
-    print(preferred[0], end="")
-elif temporary:
-    print(temporary[0], end="")
-'
-)
+flush_section_end()
 
-  printf '%s\n' "${ipv6}"
+if not section_found:
+    out.extend(["", "[IPv6AcceptRA]", "Token=prefixstable"])
+    token_written = True
+    changed = True
+
+if token_written or not token_present or changed:
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(out).rstrip() + "\n")
+PY
+
+  systemctl restart systemd-networkd
 }
 
 detect_plugin_ids() {
@@ -520,14 +555,7 @@ configure_deluge() {
   install -d -m 750 "${DELUGE_CONFIG_DIR}"
   chown -R debian-deluged:debian-deluged "${DELUGE_STATE_DIR}"
 
-  local public_ipv6
-  public_ipv6=$(detect_global_ipv6)
-  if [[ -z ${public_ipv6} ]]; then
-    echo "Unable to determine global IPv6 address." >&2
-    exit 1
-  fi
   echo "Detected Tailscale IPv4: ${TAILSCALE_IP}"
-  echo "Detected PUBLIC IPv6 (non-Tailscale): ${public_ipv6}"
 
   systemctl enable --now deluged
   local core_conf="${DELUGE_CONFIG_DIR}/core.conf"
@@ -556,9 +584,10 @@ data['move_completed_path'] = '${FINISHED_DIR}'
 data['allow_remote'] = False
 data['rpc_listen_interface'] = '127.0.0.1'
 data['rpc_listen_interface_ipv6'] = '::1'
-data['listen_interface_ipv6'] = '${public_ipv6}'
-if data.get('listen_interface') == '${TAILSCALE_IP}':
-    data['listen_interface'] = ''
+data['listen_interface'] = ''
+data['listen_interface_ipv6'] = ''
+data['random_port'] = False
+data['listen_ports'] = [6881, 6881]
 enabled = data.get('enabled_plugins', [])
 if not isinstance(enabled, list):
     raise SystemExit('enabled_plugins is not a list in core.conf')
@@ -581,7 +610,6 @@ import sys
 import tempfile
 
 config_path = "${ltconfig_conf}"
-public_ipv6 = "${public_ipv6}"
 core_conf_path = "${core_conf}"
 uid = int("${deluge_uid}")
 gid = int("${deluge_gid}")
@@ -643,10 +671,9 @@ if not isinstance(settings, dict):
     settings = {}
     body["settings"] = settings
 
+body["apply_on_start"] = True
 port_range = get_listen_port_range(core_conf_path)
-settings["listen_interfaces"] = f"[{public_ipv6}]:{port_range}"
-settings["outgoing_interfaces"] = public_ipv6
-settings["outgoing_interface"] = public_ipv6
+settings["listen_interfaces"] = f"0.0.0.0:{port_range},[::]:{port_range}"
 
 directory = os.path.dirname(config_path) or "."
 fd, tmp_path = tempfile.mkstemp(dir=directory)
@@ -680,6 +707,21 @@ data['interface'] = '${TAILSCALE_IP}'
   fi
 
   systemctl start deluge-web
+}
+
+verify_deluge_listeners() {
+  local ss_output
+  ss_output=$(ss -tulpen | egrep '(:6881\b|deluge)' || true)
+  echo "${ss_output}"
+
+  if ! grep -qE '(\[::\]:6881|:::6881)' <<<"${ss_output}"; then
+    echo "Deluge is not listening on IPv6 port 6881. Ensure ltconfig listen_interfaces includes [::]:6881 and core.conf listen_interface_ipv6 is empty." >&2
+    exit 1
+  fi
+  if ! grep -qE '(0\.0\.0\.0:6881|127\.0\.0\.1:6881)' <<<"${ss_output}"; then
+    echo "Deluge is not listening on IPv4 port 6881. Ensure ltconfig listen_interfaces includes 0.0.0.0:6881 and core.conf listen_interface is empty." >&2
+    exit 1
+  fi
 }
 
 remove_unneeded_packages() {
@@ -727,10 +769,12 @@ setup_directories
 configure_journald
 configure_btmp_rotation
 configure_deluge_quiet
+configure_systemd_networkd_prefixstable
 configure_deluge
 enable_rsync_daemon
 systemctl enable --now rsync
 remove_unneeded_packages
 disable_unwanted_listeners
+verify_deluge_listeners
 
 echo "Setup complete. Tailscale IP: ${TAILSCALE_IP}. Rsync access allowed from ${ALLOWED_IP}."
