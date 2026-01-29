@@ -652,7 +652,7 @@ PY
   systemctl stop deluge-web
 
   if [[ -f "${DELUGE_CONFIG_DIR}/web.conf" ]]; then
-    update_json_atomic "${DELUGE_CONFIG_DIR}/web.conf" "
+  update_deluge_core_conf_atomic "${DELUGE_CONFIG_DIR}/web.conf" "
 data['interface'] = '${TAILSCALE_IP}'
 " "${deluge_uid}:${deluge_gid}"
   else
