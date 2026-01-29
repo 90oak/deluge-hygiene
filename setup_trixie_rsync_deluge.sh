@@ -222,9 +222,55 @@ deluge_console_cmd() {
 detect_global_ipv6() {
   local ipv6
   ipv6=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | sed -n 's/.* src \([^ ]*\).*/\1/p' | head -n1 | tr -d '[:space:]')
-  if [[ -z ${ipv6} ]]; then
-    ipv6=$(ip -6 addr show scope global | awk '/inet6/ && $2 !~ /^fe80/ && $0 !~ /temporary/ {sub(/\/.*/,"",$2); print $2; exit}')
+  if [[ -n ${ipv6} ]]; then
+    if python3 - <<PY
+import ipaddress
+import sys
+try:
+    addr = ipaddress.IPv6Address("${ipv6}")
+except ValueError:
+    sys.exit(1)
+if addr in ipaddress.IPv6Network("2000::/3"):
+    sys.exit(0)
+sys.exit(1)
+PY
+    then
+      printf '%s\n' "${ipv6}"
+      return 0
+    fi
   fi
+
+  ipv6=$(ip -6 addr show scope global | python3 - <<'PY'
+import ipaddress
+import sys
+
+lines = sys.stdin.read().splitlines()
+preferred = []
+temporary = []
+for line in lines:
+    line = line.strip()
+    if not line.startswith("inet6 "):
+        continue
+    parts = line.split()
+    ip = parts[1].split("/")[0]
+    try:
+        addr = ipaddress.IPv6Address(ip)
+    except ValueError:
+        continue
+    if addr not in ipaddress.IPv6Network("2000::/3"):
+        continue
+    if "temporary" in parts:
+        temporary.append(ip)
+    else:
+        preferred.append(ip)
+
+if preferred:
+    print(preferred[0], end="")
+elif temporary:
+    print(temporary[0], end="")
+PY
+)
+
   printf '%s\n' "${ipv6}"
 }
 
@@ -399,18 +445,71 @@ os.replace(tmp_path, path)
 PY
 }
 
+update_deluge_core_conf_atomic() {
+  local path=$1
+  local python_snippet=$2
+  local uid_gid_mode=$3
+
+  python3 - <<PY
+import json
+import os
+import tempfile
+import sys
+
+path = "${path}"
+raw = open(path, "r", encoding="utf-8").read()
+decoder = json.JSONDecoder()
+
+try:
+    header, idx = decoder.raw_decode(raw)
+    while idx < len(raw) and raw[idx].isspace():
+        idx += 1
+    config, idx2 = decoder.raw_decode(raw, idx)
+except json.JSONDecodeError as exc:
+    print(f"Invalid core.conf format in {path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(header, dict) or not isinstance(config, dict):
+    print(f"core.conf in {path} must contain two JSON objects.", file=sys.stderr)
+    sys.exit(1)
+if "file" not in header or "format" not in header:
+    print(f"core.conf header missing file/format keys in {path}.", file=sys.stderr)
+    sys.exit(1)
+
+stat = os.stat(path)
+mode = stat.st_mode & 0o777
+uid = stat.st_uid
+gid = stat.st_gid
+
+data = config
+
+${python_snippet}
+
+directory = os.path.dirname(path) or "."
+fd, tmp_path = tempfile.mkstemp(dir=directory)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(header, sort_keys=True))
+    handle.write("\\n")
+    handle.write(json.dumps(data, sort_keys=True))
+    handle.write("\\n")
+os.chmod(tmp_path, mode)
+os.chown(tmp_path, uid, gid)
+os.replace(tmp_path, path)
+PY
+}
+
 configure_deluge() {
   install -d -m 750 "${DELUGE_CONFIG_DIR}"
   chown -R debian-deluged:debian-deluged "${DELUGE_STATE_DIR}"
 
-  local global_ipv6
-  global_ipv6=$(detect_global_ipv6)
-  if [[ -z ${global_ipv6} ]]; then
+  local public_ipv6
+  public_ipv6=$(detect_global_ipv6)
+  if [[ -z ${public_ipv6} ]]; then
     echo "Unable to determine global IPv6 address." >&2
     exit 1
   fi
   echo "Detected Tailscale IPv4: ${TAILSCALE_IP}"
-  echo "Detected global IPv6: ${global_ipv6}"
+  echo "Detected PUBLIC IPv6 (non-Tailscale): ${public_ipv6}"
 
   systemctl enable --now deluged
   local core_conf="${DELUGE_CONFIG_DIR}/core.conf"
@@ -432,11 +531,14 @@ configure_deluge() {
   deluge_uid=$(id -u debian-deluged)
   deluge_gid=$(id -g debian-deluged)
 
-  update_json_atomic "${core_conf}" "
+  update_deluge_core_conf_atomic "${core_conf}" "
 data['download_location'] = '${DOWNLOAD_DIR}'
 data['move_completed'] = True
 data['move_completed_path'] = '${FINISHED_DIR}'
-data['listen_interface_ipv6'] = '${global_ipv6}'
+data['allow_remote'] = False
+data['rpc_listen_interface'] = '127.0.0.1'
+data['rpc_listen_interface_ipv6'] = '::1'
+data['listen_interface_ipv6'] = '${public_ipv6}'
 if data.get('listen_interface') == '${TAILSCALE_IP}':
     data['listen_interface'] = ''
 enabled = data.get('enabled_plugins', [])
@@ -468,7 +570,7 @@ import tempfile
 import zipfile
 
 config_path = "${ltconfig_conf}"
-global_ipv6 = "${global_ipv6}"
+public_ipv6 = "${public_ipv6}"
 plugin_egg = "${ltconfig_plugin_source}"
 uid = int("${deluge_uid}")
 gid = int("${deluge_gid}")
@@ -505,6 +607,7 @@ def extract_defaults(egg_path):
         return None
     return None
 
+created = False
 if os.path.exists(config_path):
     data = load_json(config_path)
     stat = os.stat(config_path)
@@ -515,19 +618,74 @@ else:
         print(f"No ltconfig config found and unable to derive defaults from {plugin_egg}.", file=sys.stderr)
         sys.exit(1)
     mode = 0o600
+    created = True
 if not isinstance(data, dict):
     print(f"ltconfig config {config_path} did not contain a JSON object.", file=sys.stderr)
     sys.exit(1)
 
-target = data.get("settings")
-if isinstance(target, dict):
-    settings = target
-else:
-    settings = data
+settings = data.get("settings") if isinstance(data.get("settings"), dict) else data
+if not isinstance(settings, dict):
+    print(f"ltconfig config {config_path} did not contain a settings object.", file=sys.stderr)
+    sys.exit(1)
 
-settings["listen_interfaces"] = global_ipv6
-settings["outgoing_interfaces"] = global_ipv6
-settings["outgoing_interface"] = global_ipv6
+listen_key = next((key for key in ("listen_interfaces", "listen_interface") if key in settings), None)
+outgoing_keys = [key for key in ("outgoing_interfaces", "outgoing_interface") if key in settings]
+if not listen_key or not outgoing_keys:
+    top_keys = sorted(data.keys())
+    print(
+        "Unable to locate ltconfig interface keys in config. "
+        f"Top-level keys: {top_keys}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+listen_value = settings.get(listen_key)
+if isinstance(listen_value, str):
+    if ":" in listen_value:
+        import re
+        match = re.search(r":(\\d+(?:-\\d+)?)", listen_value)
+        if not match:
+            print(
+                f"Unable to infer listen port range from ltconfig {listen_key}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        port_range = match.group(1)
+        settings[listen_key] = f"[{public_ipv6}]:{port_range}"
+    else:
+        settings[listen_key] = public_ipv6
+elif isinstance(listen_value, list):
+    updated = False
+    new_list = []
+    for entry in listen_value:
+        if isinstance(entry, str) and entry:
+            if entry.startswith("[") and "]" in entry and ":" in entry:
+                port_part = entry.split("]:", 1)[1]
+                new_list.append(f"[{public_ipv6}]:{port_part}")
+                updated = True
+            elif ":" not in entry:
+                new_list.append(public_ipv6)
+                updated = True
+            else:
+                new_list.append(entry)
+        else:
+            new_list.append(entry)
+    if not updated:
+        print(
+            f"Unable to infer listen interface format from ltconfig {listen_key}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    settings[listen_key] = new_list
+else:
+    print(
+        f"Unsupported ltconfig {listen_key} type: {type(listen_value).__name__}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+for key in outgoing_keys:
+    settings[key] = public_ipv6
 
 directory = os.path.dirname(config_path) or "."
 fd, tmp_path = tempfile.mkstemp(dir=directory)
@@ -537,7 +695,10 @@ with os.fdopen(fd, "w", encoding="utf-8") as handle:
 os.chmod(tmp_path, mode)
 os.chown(tmp_path, uid, gid)
 os.replace(tmp_path, config_path)
-print(f"ltconfig config updated at {config_path}.")
+if created:
+    print(f"ltconfig config created at {config_path}.")
+else:
+    print(f"ltconfig config updated at {config_path}.")
 PY
 
   systemctl start deluged
