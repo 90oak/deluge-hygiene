@@ -453,22 +453,27 @@ import sys
 path = "${path}"
 raw = open(path, "r", encoding="utf-8").read()
 decoder = json.JSONDecoder()
+header = None
+config = None
 
 try:
     header, idx = decoder.raw_decode(raw)
     while idx < len(raw) and raw[idx].isspace():
         idx += 1
-    config, idx2 = decoder.raw_decode(raw, idx)
-except json.JSONDecodeError as exc:
-    print(f"Invalid core.conf format in {path}: {exc}", file=sys.stderr)
-    sys.exit(1)
+    config, _ = decoder.raw_decode(raw, idx)
+except json.JSONDecodeError:
+    try:
+        config = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"Invalid core.conf format in {path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    header = {"file": 1, "format": 1}
 
 if not isinstance(header, dict) or not isinstance(config, dict):
-    print(f"core.conf in {path} must contain two JSON objects.", file=sys.stderr)
+    print(f"core.conf in {path} must contain JSON objects.", file=sys.stderr)
     sys.exit(1)
 if "file" not in header or "format" not in header:
-    print(f"core.conf header missing file/format keys in {path}.", file=sys.stderr)
-    sys.exit(1)
+    header = {"file": 1, "format": 1}
 
 stat = os.stat(path)
 mode = stat.st_mode & 0o777
@@ -550,141 +555,86 @@ data['enabled_plugins'] = enabled
     ltconfig_conf="${DELUGE_CONFIG_DIR}/ltconfig.conf"
   fi
 
-  local ltconfig_plugin_source="${ltconfig_plugin_egg}"
-  if [[ ${ltconfig_plugin_source} != /* ]]; then
-    ltconfig_plugin_source="${DELUGE_CONFIG_DIR}/plugins/${ltconfig_plugin_egg}"
-  fi
-
   python3 - <<PY
-import ast
 import json
 import os
 import sys
 import tempfile
-import zipfile
 
 config_path = "${ltconfig_conf}"
 public_ipv6 = "${public_ipv6}"
-plugin_egg = "${ltconfig_plugin_source}"
+core_conf_path = "${core_conf}"
 uid = int("${deluge_uid}")
 gid = int("${deluge_gid}")
 
-def load_json(path):
+def load_deluge_config(path):
     raw = open(path, "r", encoding="utf-8").read()
+    decoder = json.JSONDecoder()
+    header = None
+    body = None
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        print(f"ltconfig config {path} is not valid JSON: {exc}", file=sys.stderr)
+        header, idx = decoder.raw_decode(raw)
+        while idx < len(raw) and raw[idx].isspace():
+            idx += 1
+        body, _ = decoder.raw_decode(raw, idx)
+    except json.JSONDecodeError:
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            print(f"Invalid JSON in {path}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        header = {"file": 1, "format": 1}
+    if not isinstance(header, dict) or not isinstance(body, dict):
+        print(f"Config file {path} must contain JSON objects.", file=sys.stderr)
         sys.exit(1)
+    if "file" not in header or "format" not in header:
+        header = {"file": 1, "format": 1}
+    return header, body
 
-def extract_defaults(egg_path):
-    if not os.path.exists(egg_path):
-        return None
-    try:
-        with zipfile.ZipFile(egg_path) as zf:
-            for name in zf.namelist():
-                if not name.endswith(".py"):
-                    continue
-                text = zf.read(name).decode("utf-8", errors="ignore")
-                for key in ("DEFAULT_PREFS", "DEFAULT_CONFIG", "DEFAULT_SETTINGS"):
-                    if key in text:
-                        try:
-                            module = ast.parse(text, filename=name)
-                        except SyntaxError:
-                            continue
-                        for node in module.body:
-                            if isinstance(node, ast.Assign):
-                                for target in node.targets:
-                                    if isinstance(target, ast.Name) and target.id == key:
-                                        return ast.literal_eval(node.value)
-    except zipfile.BadZipFile:
-        return None
-    return None
+def get_listen_port_range(path):
+    if not os.path.exists(path):
+        return "6881"
+    _, core_body = load_deluge_config(path)
+    listen_ports = core_body.get("listen_ports")
+    if isinstance(listen_ports, list) and len(listen_ports) == 2:
+        start, end = listen_ports
+        if isinstance(start, int) and isinstance(end, int):
+            return str(start) if start == end else f"{start}-{end}"
+    if isinstance(listen_ports, int):
+        return str(listen_ports)
+    return "6881"
 
 created = False
 if os.path.exists(config_path):
-    data = load_json(config_path)
+    header, body = load_deluge_config(config_path)
     stat = os.stat(config_path)
     mode = stat.st_mode & 0o777
 else:
-    data = extract_defaults(plugin_egg)
-    if data is None:
-        print(f"No ltconfig config found and unable to derive defaults from {plugin_egg}.", file=sys.stderr)
-        sys.exit(1)
+    header = {"file": 1, "format": 1}
+    body = {"apply_on_start": True, "settings": {}}
     mode = 0o600
     created = True
-if not isinstance(data, dict):
+
+if not isinstance(body, dict):
     print(f"ltconfig config {config_path} did not contain a JSON object.", file=sys.stderr)
     sys.exit(1)
 
-settings = data.get("settings") if isinstance(data.get("settings"), dict) else data
+settings = body.get("settings")
 if not isinstance(settings, dict):
-    print(f"ltconfig config {config_path} did not contain a settings object.", file=sys.stderr)
-    sys.exit(1)
+    settings = {}
+    body["settings"] = settings
 
-listen_key = next((key for key in ("listen_interfaces", "listen_interface") if key in settings), None)
-outgoing_keys = [key for key in ("outgoing_interfaces", "outgoing_interface") if key in settings]
-if not listen_key or not outgoing_keys:
-    top_keys = sorted(data.keys())
-    print(
-        "Unable to locate ltconfig interface keys in config. "
-        f"Top-level keys: {top_keys}",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-listen_value = settings.get(listen_key)
-if isinstance(listen_value, str):
-    if ":" in listen_value:
-        import re
-        match = re.search(r":(\\d+(?:-\\d+)?)", listen_value)
-        if not match:
-            print(
-                f"Unable to infer listen port range from ltconfig {listen_key}.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        port_range = match.group(1)
-        settings[listen_key] = f"[{public_ipv6}]:{port_range}"
-    else:
-        settings[listen_key] = public_ipv6
-elif isinstance(listen_value, list):
-    updated = False
-    new_list = []
-    for entry in listen_value:
-        if isinstance(entry, str) and entry:
-            if entry.startswith("[") and "]" in entry and ":" in entry:
-                port_part = entry.split("]:", 1)[1]
-                new_list.append(f"[{public_ipv6}]:{port_part}")
-                updated = True
-            elif ":" not in entry:
-                new_list.append(public_ipv6)
-                updated = True
-            else:
-                new_list.append(entry)
-        else:
-            new_list.append(entry)
-    if not updated:
-        print(
-            f"Unable to infer listen interface format from ltconfig {listen_key}.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    settings[listen_key] = new_list
-else:
-    print(
-        f"Unsupported ltconfig {listen_key} type: {type(listen_value).__name__}",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-for key in outgoing_keys:
-    settings[key] = public_ipv6
+port_range = get_listen_port_range(core_conf_path)
+settings["listen_interfaces"] = f"[{public_ipv6}]:{port_range}"
+settings["outgoing_interfaces"] = public_ipv6
+settings["outgoing_interface"] = public_ipv6
 
 directory = os.path.dirname(config_path) or "."
 fd, tmp_path = tempfile.mkstemp(dir=directory)
 with os.fdopen(fd, "w", encoding="utf-8") as handle:
-    json.dump(data, handle, indent=2, sort_keys=True)
+    handle.write(json.dumps(header, sort_keys=True))
+    handle.write("\\n")
+    handle.write(json.dumps(body, sort_keys=True))
     handle.write("\\n")
 os.chmod(tmp_path, mode)
 os.chown(tmp_path, uid, gid)
