@@ -64,7 +64,7 @@ install_packages() {
 ensure_ltconfig_plugin() {
   local plugin_dir="${DELUGE_CONFIG_DIR}/plugins"
 
-  if ls "${plugin_dir}/ltconfig"*.egg >/dev/null 2>&1; then
+  if ls "${plugin_dir}/ltConfig"*.egg >/dev/null 2>&1; then
     return 0
   fi
 
