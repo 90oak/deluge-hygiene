@@ -240,13 +240,10 @@ PY
     fi
   fi
 
-  ipv6=$(ip -6 addr show scope global | python3 - <<'PY'
-import ipaddress
-import sys
-
+ ipv6=$(ip -6 addr show scope global | python3 -c '
+import ipaddress, sys
 lines = sys.stdin.read().splitlines()
-preferred = []
-temporary = []
+preferred, temporary = [], []
 for line in lines:
     line = line.strip()
     if not line.startswith("inet6 "):
@@ -259,16 +256,13 @@ for line in lines:
         continue
     if addr not in ipaddress.IPv6Network("2000::/3"):
         continue
-    if "temporary" in parts:
-        temporary.append(ip)
-    else:
-        preferred.append(ip)
+    (temporary if "temporary" in parts else preferred).append(ip)
 
 if preferred:
     print(preferred[0], end="")
 elif temporary:
     print(temporary[0], end="")
-PY
+'
 )
 
   printf '%s\n' "${ipv6}"
