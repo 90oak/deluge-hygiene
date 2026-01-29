@@ -51,6 +51,153 @@ show_available_ifaces() {
   ip -br link
 }
 
+is_systemd_networkd_active() {
+  systemctl is-active --quiet systemd-networkd
+}
+
+networkd_file_matches_iface() {
+  local file="$1"
+  awk -v iface="$IFACE" '
+    BEGIN { in_match=0; found=0 }
+    /^[[:space:]]*\[Match\]/ { in_match=1; next }
+    /^[[:space:]]*\[/ { in_match=0 }
+    in_match && $0 ~ /^[[:space:]]*Name=/ {
+      line=$0
+      sub(/^[[:space:]]*Name=/, "", line)
+      n=split(line, arr, /[[:space:]]+/)
+      for (i=1; i<=n; i++) {
+        if (arr[i] == iface) {
+          found=1
+        }
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' "$file"
+}
+
+find_networkd_match_file() {
+  local dir="/etc/systemd/network"
+  local file
+
+  if [[ ! -d "$dir" ]]; then
+    return 1
+  fi
+
+  for file in "$dir"/*.network; do
+    [[ -e "$file" ]] || continue
+    if networkd_file_matches_iface "$file"; then
+      printf '%s\n' "$file"
+      return 0
+    fi
+  done
+  return 1
+}
+
+render_networkd_file_with_token() {
+  local file="$1"
+  local token_line="Token=prefixstable"
+  awk -v token="$token_line" '
+    function flush_ra() {
+      if (in_ra && token_written == 0) {
+        print token
+        token_written=1
+      }
+    }
+    BEGIN { in_ra=0; token_written=0; saw_ra=0 }
+    /^[[:space:]]*\[IPv6AcceptRA\]/ {
+      flush_ra()
+      in_ra=1
+      token_written=0
+      saw_ra=1
+      print
+      next
+    }
+    /^[[:space:]]*\[/ {
+      flush_ra()
+      in_ra=0
+      token_written=0
+      print
+      next
+    }
+    {
+      if (in_ra && $0 ~ /^[[:space:]]*Token=/) {
+        if (token_written == 0) {
+          print token
+          token_written=1
+        }
+        next
+      }
+      print
+    }
+    END {
+      flush_ra()
+      if (saw_ra == 0) {
+        print ""
+        print "[IPv6AcceptRA]"
+        print token
+      }
+    }
+  ' "$file"
+}
+
+ensure_networkd_token_prefixstable() {
+  local networkd_file
+  local target_file
+
+  if ! is_systemd_networkd_active; then
+    log "systemd-networkd is not active; skipping Token=prefixstable configuration"
+    return 0
+  fi
+
+  if networkd_file=$(find_networkd_match_file); then
+    log "Ensuring IPv6AcceptRA Token=prefixstable in ${networkd_file}"
+    if [[ $DRY_RUN -eq 1 ]]; then
+      log "DRY-RUN: would update ${networkd_file} to:"
+      render_networkd_file_with_token "$networkd_file"
+      return 0
+    fi
+
+    local tmp_file
+    tmp_file=$(mktemp)
+    render_networkd_file_with_token "$networkd_file" > "$tmp_file"
+
+    if cmp -s "$networkd_file" "$tmp_file"; then
+      log "No changes needed in ${networkd_file}"
+      rm -f "$tmp_file"
+      return 0
+    fi
+
+    local mode owner group
+    mode=$(stat -c '%a' "$networkd_file")
+    owner=$(stat -c '%u' "$networkd_file")
+    group=$(stat -c '%g' "$networkd_file")
+
+    install -m "$mode" -o "$owner" -g "$group" "$tmp_file" "$networkd_file"
+    rm -f "$tmp_file"
+    return 0
+  fi
+
+  target_file="/etc/systemd/network/10-${IFACE}.network"
+  log "Creating ${target_file} with Token=prefixstable"
+
+  local content="[Match]
+Name=${IFACE}
+[Network]
+DHCP=yes
+IPv6AcceptRA=yes
+[IPv6AcceptRA]
+Token=prefixstable"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log "DRY-RUN: would create ${target_file} with:"
+    printf '%s\n' "$content"
+    return 0
+  fi
+
+  mkdir -p /etc/systemd/network
+  printf '%s\n' "$content" > "$target_file"
+}
+
 sysctl_get() {
   sysctl -n "$1" 2>/dev/null || true
 }
@@ -136,6 +283,16 @@ wait_for_global_ipv6() {
     elapsed=$((elapsed + interval))
   done
   return 1
+}
+
+restart_systemd_networkd_if_active() {
+  if ! is_systemd_networkd_active; then
+    log "systemd-networkd is not active; skipping restart"
+    return 0
+  fi
+
+  log "Restarting systemd-networkd"
+  run_cmd "systemctl restart systemd-networkd"
 }
 
 restart_deluge_services() {
@@ -276,6 +433,8 @@ main() {
 
   if [[ $DRY_RUN -eq 1 ]]; then
     log "Planned actions:"
+    log "- Ensure systemd-networkd Token=prefixstable for ${IFACE} (edit existing or create /etc/systemd/network/10-${IFACE}.network)"
+    log "- Restart systemd-networkd if active"
     log "- Set sysctl net.ipv6.conf.all.use_tempaddr=2"
     log "- Set sysctl net.ipv6.conf.default.use_tempaddr=2"
     log "- Set sysctl net.ipv6.conf.${IFACE}.use_tempaddr=2"
@@ -288,11 +447,13 @@ main() {
     log "- Verify Deluge listens on IPv4+IPv6"
   fi
 
+  ensure_networkd_token_prefixstable
+  restart_systemd_networkd_if_active
   apply_ipv6_privacy
   flush_and_reconfigure_iface
 
   if ! wait_for_global_ipv6; then
-    log "ERROR: Timed out waiting for global IPv6 without ff:fe"
+    log "ERROR: Timed out waiting for global IPv6 without ff:fe on ${IFACE}"
     ip -6 addr show dev "$IFACE" || true
     exit 1
   fi
