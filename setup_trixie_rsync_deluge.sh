@@ -169,13 +169,23 @@ wait_for_deluge() {
   return 1
 }
 
+deluge_console_cmd() {
+  local cmd=$1
+  local console_base=(sudo -u debian-deluged deluge-console -c "${DELUGE_CONFIG_DIR}")
+
+  if "${console_base[@]}" --help 2>&1 | grep -q -- "--command"; then
+    "${console_base[@]}" --command "${cmd}"
+  else
+    "${console_base[@]}" "${cmd}"
+  fi
+}
+
 wait_for_plugin() {
   local plugin_name=$1
   local attempts=15
 
   while (( attempts > 0 )); do
-    if sudo -u debian-deluged deluge-console -c "${DELUGE_CONFIG_DIR}" \
-      "connect 127.0.0.1:58846; plugin -l" | grep -q "${plugin_name}"; then
+    if deluge_console_cmd "connect 127.0.0.1:58846; plugin -l" | grep -q "${plugin_name}"; then
       return 0
     fi
     sleep 1
@@ -196,23 +206,27 @@ configure_deluge() {
     exit 1
   fi
 
-  sudo -u debian-deluged deluge-console -c "${DELUGE_CONFIG_DIR}" \
-    "connect 127.0.0.1:58846; \
+  local base_config_cmd
+  base_config_cmd="connect 127.0.0.1:58846; \
     config -s download_location \"${DOWNLOAD_DIR}\"; \
     config -s move_completed true; \
     config -s move_completed_path \"${FINISHED_DIR}\"; \
     config -s listen_interface \"${TAILSCALE_IP}\"; \
-    config -s listen_interface_ipv6 \"\"; \
     plugin -e Label; \
     plugin -e ltconfig"
+
+  if deluge_console_cmd "connect 127.0.0.1:58846; config -l" | grep -q "^listen_interface_ipv6"; then
+    base_config_cmd="${base_config_cmd}; config -s listen_interface_ipv6 \"\""
+  fi
+
+  deluge_console_cmd "${base_config_cmd}"
 
   if ! wait_for_plugin "Label"; then
     echo "Label plugin did not become available." >&2
     exit 1
   fi
 
-  sudo -u debian-deluged deluge-console -c "${DELUGE_CONFIG_DIR}" \
-    "connect 127.0.0.1:58846; \
+  deluge_console_cmd "connect 127.0.0.1:58846; \
     label add books; \
     label set books move_completed True; \
     label set books move_completed_path \"${BOOKS_DIR}\""
