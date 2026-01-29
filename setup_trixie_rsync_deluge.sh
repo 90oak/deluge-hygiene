@@ -27,7 +27,8 @@ BASE_DIR="/srv/deluge"
 DOWNLOAD_DIR="${BASE_DIR}/Downloads"
 FINISHED_DIR="${BASE_DIR}/Finished"
 BOOKS_DIR="${BASE_DIR}/Books"
-DELUGE_CONFIG_DIR="/var/lib/deluge/.config/deluge"
+DELUGE_STATE_DIR="/var/lib/deluged"
+DELUGE_CONFIG_DIR="${DELUGE_STATE_DIR}/config"
 
 configure_lean_apt() {
   cat > /etc/apt/apt.conf.d/99lean <<'APTCONF'
@@ -152,7 +153,7 @@ configure_deluge_quiet() {
   cat > /etc/systemd/system/deluged.service.d/override.conf <<'DELUGED'
 [Service]
 ExecStart=
-ExecStart=/usr/bin/deluged -d -q -c /var/lib/deluge/.config/deluge
+ExecStart=/usr/bin/deluged -d -q -c /var/lib/deluged/config
 DELUGED
   systemctl daemon-reload
 }
@@ -182,7 +183,7 @@ deluge_console_cmd() {
 
 configure_deluge() {
   install -d -m 750 "${DELUGE_CONFIG_DIR}"
-  chown -R debian-deluged:debian-deluged /var/lib/deluge
+  chown -R debian-deluged:debian-deluged "${DELUGE_STATE_DIR}"
 
   systemctl enable --now deluged
 
@@ -191,18 +192,14 @@ configure_deluge() {
     exit 1
   fi
 
-  local base_config_cmd
-  base_config_cmd="connect 127.0.0.1:58846; \
-    config -s download_location \"${DOWNLOAD_DIR}\"; \
-    config -s move_completed true; \
-    config -s move_completed_path \"${FINISHED_DIR}\"; \
-    config -s listen_interface \"${TAILSCALE_IP}\""
+  deluge_console_cmd "connect 127.0.0.1:58846; config -s download_location \"${DOWNLOAD_DIR}\""
+  deluge_console_cmd "connect 127.0.0.1:58846; config -s move_completed true"
+  deluge_console_cmd "connect 127.0.0.1:58846; config -s move_completed_path \"${FINISHED_DIR}\""
+  deluge_console_cmd "connect 127.0.0.1:58846; config -s listen_interface \"${TAILSCALE_IP}\""
 
   if deluge_console_cmd "connect 127.0.0.1:58846; config -l" | grep -q "^listen_interface_ipv6"; then
-    base_config_cmd="${base_config_cmd}; config -s listen_interface_ipv6 \"\""
+    echo "Detected listen_interface_ipv6 in Deluge config; leaving existing value unchanged."
   fi
-
-  deluge_console_cmd "${base_config_cmd}"
 
   systemctl restart deluged
 
