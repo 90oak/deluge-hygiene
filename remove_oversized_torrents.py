@@ -24,7 +24,9 @@ def main():
 
     # ✅ Get all torrents (both downloading and seeding)
     torrents = client.call(
-        "core.get_torrents_status", {}, ["name", "total_size", "progress", "files"]
+        "core.get_torrents_status",
+        {},
+        ["name", "total_size", "progress", "files", "label"],
     )
 
     # ✅ Get available disk space
@@ -44,6 +46,12 @@ def main():
         total_size = data["total_size"]
         progress = data["progress"]
         files = data.get("files", [])
+        label = data.get("label")
+
+        if label == "ingested":
+            print(f"🧹 Removing labeled torrent: {name} (ID: {torrent_id}) - label=ingested")
+            client.call("core.remove_torrent", torrent_id, True)  # True = remove data
+            continue
 
         has_blocked_extension = False
         for file_info in files:
