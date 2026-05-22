@@ -1,0 +1,116 @@
+# Trixie Deluge Burst Storage
+
+This is the replacement for the old Buster `burst_provision_local.sh` and
+`burst_teardown_local.sh` pair.
+
+## Design
+
+The normal Trixie setup keeps Deluge under:
+
+- Incomplete downloads: `/srv/deluge/Downloads`
+- Finished downloads: `/srv/deluge/Finished`
+- Rsync daemon module: `finished` -> `/srv/deluge/Finished`
+
+Burst mode temporarily creates a Scaleway SBS block volume and mounts it at:
+
+- Burst mount: `/srv/deluge/.burst`
+- Burst incomplete downloads: `/srv/deluge/.burst/incomplete`
+- Burst completed downloads: `/srv/deluge/.burst/completed`
+- Rsync-visible bind mount: `/srv/deluge/Finished/_overflow`
+
+When burst mode is active, Deluge is reconfigured to download new torrents into
+the burst incomplete directory and move completed data into
+`/srv/deluge/Finished/_overflow`. Because `_overflow` is inside the existing
+`Finished` tree, the Synology rsync pull keeps using the same `finished` module.
+The hidden incomplete directory is not visible to the rsync module.
+
+The controller only changes Deluge's path settings:
+
+- `download_location`
+- `move_completed`
+- `move_completed_path`
+
+It does not change Deluge plugins, labels, ltConfig, Sonarr, or Radarr settings.
+The Label plugin can keep using `ingested` so the cleanup script removes torrents
+after Sonarr/Radarr ingestion.
+
+## Files
+
+- `deluge_burstctl.sh`: root-only controller with `provision`, `teardown`,
+  `restore-base`, and `status`.
+- `remove_oversized_torrents.py`: cron-safe cleanup script that reads Deluge's
+  current active download path, so it works during normal and burst modes.
+- `install_trixie_burst.sh`: installs the controller, cleanup script, cron entry,
+  and optional passwordless sudo policy for an SSH user.
+
+## Debian Deployment
+
+Copy these files to the Debian box, then run:
+
+```bash
+sudo bash install_trixie_burst.sh --shortcut-user YOUR_SSH_USER
+```
+
+If you already have a cron entry for `remove_oversized_torrents.py`, either point
+it at `/usr/local/sbin/remove_oversized_torrents.py` or remove the old duplicate
+after the installer creates `/etc/cron.d/deluge-remove-oversized`.
+
+The burst controller expects the Scaleway CLI (`scw`) to be installed and
+authenticated on the Debian box. It also uses `python3`, `lsblk`, `blkid`,
+`mount`, `findmnt`, `flock`, and `systemctl`, which are normally present on the
+Trixie server except for provider-specific tools. If `curl` is present, the
+controller uses Scaleway instance metadata to auto-detect the server and zone;
+otherwise it falls back to the Scaleway CLI.
+
+The cleanup cron uses the Python `deluge_client` package, matching the existing
+cron script's RPC approach. The installer warns if `/usr/bin/python3` cannot
+import it.
+
+## iPhone Shortcut Commands
+
+Use the Shortcuts action "Run Script over SSH".
+
+Provision 600 GB:
+
+```bash
+sudo -n /usr/local/sbin/deluge-burstctl provision --size-gb 600 --yes
+```
+
+Check status:
+
+```bash
+sudo -n /usr/local/sbin/deluge-burstctl status
+```
+
+Teardown after Synology/Sonarr/Radarr have drained `_overflow`:
+
+```bash
+sudo -n /usr/local/sbin/deluge-burstctl teardown --yes
+```
+
+Teardown refuses to delete the volume while either
+`/srv/deluge/.burst/incomplete` or `/srv/deluge/.burst/completed` still contains
+data.
+
+## Operational Flow
+
+1. Run `provision` from the iPhone before adding the large torrent.
+2. Add the large torrent to Deluge as usual.
+3. Completed burst downloads appear under `Finished/_overflow` for the existing
+   Synology rsync pull.
+4. Sonarr/Radarr ingest as usual. If they label the torrent `ingested`, the cron
+   cleanup removes the torrent and its data.
+5. Once `_overflow` and the burst incomplete directory are empty, run `teardown`.
+
+If something looks half-active after a failed operation or reboot, run:
+
+```bash
+sudo /usr/local/sbin/deluge-burstctl status
+```
+
+If you only need to put Deluge back on the base disk without deleting a volume,
+run:
+
+```bash
+sudo /usr/local/sbin/deluge-burstctl restore-base
+```
