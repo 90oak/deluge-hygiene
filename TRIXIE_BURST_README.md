@@ -20,9 +20,15 @@ Burst mode temporarily creates a Scaleway SBS block volume and mounts it at:
 
 When burst mode is active, Deluge is reconfigured to download new torrents into
 the burst incomplete directory and move completed data into
+`/srv/deluge/.burst/completed`. That real completed directory is bind-mounted at
 `/srv/deluge/Finished/_overflow`. Because `_overflow` is inside the existing
 `Finished` tree, the Synology rsync pull keeps using the same `finished` module.
 The hidden incomplete directory is not visible to the rsync module.
+
+Deluge must use `/srv/deluge/.burst/completed` as its completed path, not the
+bind-mounted `/srv/deluge/Finished/_overflow` view. Moving from the real burst
+incomplete directory to the bind-mounted view can degrade into a copy-then-delete
+operation and temporarily require roughly 2x the torrent size.
 
 The controller only changes Deluge's path settings:
 
@@ -37,7 +43,7 @@ after Sonarr/Radarr ingestion.
 ## Files
 
 - `deluge_burstctl.sh`: root-only controller with `provision`, `teardown`,
-  `restore-base`, and `status`.
+  `repair-active`, `restore-base`, and `status`.
 - `remove_oversized_torrents.py`: cron-safe cleanup script that reads Deluge's
   current active download path, so it works during normal and burst modes.
 - `install_trixie_burst.sh`: installs the controller, cleanup script, cron entry,
@@ -50,6 +56,32 @@ Copy these files to the Debian box, then run:
 ```bash
 sudo bash install_trixie_burst.sh --shortcut-user YOUR_SSH_USER
 ```
+
+For an IPv6-only box that needs Tailscale for IPv4 API egress, save the exit
+node at install time without putting the node name in this repo:
+
+```bash
+sudo bash install_trixie_burst.sh \
+  --shortcut-user YOUR_SSH_USER \
+  --prompt-tailscale-exit-node
+```
+
+The prompt writes the value only to `/etc/default/deluge-burst` on the Debian
+box. You can also pass `--tailscale-exit-node <node>` explicitly if you are not
+concerned about shell history on that host.
+
+If auto-detecting the Scaleway server ID fails, rerun the installer with:
+
+```bash
+sudo bash install_trixie_burst.sh \
+  --shortcut-user YOUR_SSH_USER \
+  --prompt-tailscale-exit-node \
+  --prompt-server-id \
+  --zone nl-ams-1
+```
+
+The server ID is stored locally in `/etc/default/deluge-burst` as
+`DELUGE_BURST_SERVER_ID`.
 
 If you already have a cron entry for `remove_oversized_torrents.py`, either point
 it at `/usr/local/sbin/remove_oversized_torrents.py` or remove the old duplicate
@@ -114,3 +146,58 @@ run:
 ```bash
 sudo /usr/local/sbin/deluge-burstctl restore-base
 ```
+
+If an active burst volume was provisioned by an older script version that set
+Deluge's completed path to `/srv/deluge/Finished/_overflow`, repair it with:
+
+```bash
+sudo /usr/local/sbin/deluge-burstctl repair-active
+```
+
+## IPv6-Only Hosts
+
+The Scaleway control-plane API may resolve to IPv4-only addresses from this
+host. If the Deluge box has no IPv4 egress, `scw` commands can fail with
+`dial tcp ... network is unreachable`.
+
+Scaleway's Instance metadata service is local to the Instance, not a public DNS
+name. On IPv6-only hosts, test the IPv6 metadata endpoint:
+
+```bash
+curl -g -6 --max-time 3 'http://[fd00:42::42]/conf?format=json'
+```
+
+The IPv4 metadata endpoint is `169.254.42.42`, but it may hang or be unrouted on
+an IPv6-only host:
+
+```bash
+curl -4 --local-port 1-1023 --max-time 3 'http://169.254.42.42/conf?format=json'
+```
+
+The controller can do this automatically. Put the exit node in
+`/etc/default/deluge-burst`:
+
+```bash
+DELUGE_BURST_TAILSCALE_EXIT_NODE=<exit-node-name-or-100.x.y.z>
+DELUGE_BURST_TAILSCALE_ALLOW_LAN_ACCESS=true
+DELUGE_BURST_TAILSCALE_RESTORE_ADVERTISE_EXIT_NODE=auto
+DELUGE_BURST_SERVER_ID=<scaleway-server-id-if-autodetect-fails>
+DELUGE_BURST_ZONE=nl-ams-1
+```
+
+Or pass it per command:
+
+```bash
+sudo /usr/local/sbin/deluge-burstctl provision --size-gb 600 --tailscale-exit-node <exit-node-name-or-100.x.y.z> --yes
+```
+
+When configured, `deluge-burstctl` temporarily disables exit-node advertising,
+sets the requested exit node, runs the Scaleway API calls, clears the exit node,
+and restores advertising if it was enabled before. Torrent traffic should not
+remain routed through the exit node after the command finishes.
+
+The cleaner long-term alternative is to run Scaleway API calls from an
+IPv4-capable helper host, then SSH into the IPv6-only Deluge box only for the
+local mount and Deluge path changes. That requires splitting the current
+all-in-one controller into a remote control-plane script plus a local
+mount/config script.
