@@ -30,6 +30,7 @@ DEFAULT_ZONE="${SCW_DEFAULT_ZONE:-nl-ams-1}"
 DEFAULT_IOPS="5000"
 DEFAULT_FS="ext4"
 DEFAULT_NAME_PREFIX="deluge-burst"
+CONFIG_FILE="${DELUGE_BURST_CONFIG:-/etc/default/deluge-burst}"
 
 COMMAND=""
 SIZE_GB=""
@@ -39,6 +40,14 @@ FS="${DEFAULT_FS}"
 NAME_PREFIX="${DEFAULT_NAME_PREFIX}"
 SERVER_ID=""
 ASSUME_YES=0
+TAILSCALE_EXIT_NODE=""
+TAILSCALE_ALLOW_LAN_ACCESS="true"
+TAILSCALE_RESTORE_ADVERTISE_EXIT_NODE="auto"
+TAILSCALE_EGRESS_ACTIVE=0
+TAILSCALE_STATE_CAPTURED=0
+TAILSCALE_WAS_ADVERTISING_EXIT_NODE=0
+TAILSCALE_PREVIOUS_EXIT_NODE=""
+TAILSCALE_PREVIOUS_ALLOW_LAN_ACCESS="false"
 
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -53,7 +62,8 @@ usage() {
   cat <<USAGE
 Usage:
   $(basename "$0") provision --size-gb <gb> [--zone <zone>] [--iops 5000|15000] [--fs ext4|xfs] [--name-prefix <prefix>] [--server-id <id>] [--yes]
-  $(basename "$0") teardown [--yes]
+  $(basename "$0") teardown [--volume-id <id>] [--yes]
+  $(basename "$0") repair-active
   $(basename "$0") restore-base
   $(basename "$0") status
 
@@ -63,9 +73,13 @@ Examples:
   sudo $(basename "$0") teardown
 
 The provision command creates and attaches a Scaleway SBS block volume, mounts it at
-${BURST_MOUNT}, sends new incomplete downloads to ${BURST_INCOMPLETE}, and exposes
-completed burst downloads under ${BURST_BIND_TARGET} so the existing rsync
-"finished" module keeps working.
+${BURST_MOUNT}, sends new incomplete downloads to ${BURST_INCOMPLETE}, moves
+completed downloads to ${BURST_COMPLETED}, and exposes them through
+${BURST_BIND_TARGET} so the existing rsync "finished" module keeps working.
+
+IPv6-only hosts can set a temporary Tailscale exit node for Scaleway API calls:
+  $(basename "$0") provision --size-gb 600 --tailscale-exit-node <node> --yes
+or put DELUGE_BURST_TAILSCALE_EXIT_NODE=<node> in ${CONFIG_FILE}.
 USAGE
 }
 
@@ -75,6 +89,26 @@ require_root() {
 
 have() {
   command -v "$1" >/dev/null 2>&1
+}
+
+load_config() {
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${CONFIG_FILE}"
+  fi
+
+  ZONE="${DELUGE_BURST_ZONE:-${ZONE}}"
+  SERVER_ID="${DELUGE_BURST_SERVER_ID:-${SERVER_ID}}"
+  TAILSCALE_EXIT_NODE="${DELUGE_BURST_TAILSCALE_EXIT_NODE:-${TAILSCALE_EXIT_NODE}}"
+  TAILSCALE_ALLOW_LAN_ACCESS="${DELUGE_BURST_TAILSCALE_ALLOW_LAN_ACCESS:-${TAILSCALE_ALLOW_LAN_ACCESS}}"
+  TAILSCALE_RESTORE_ADVERTISE_EXIT_NODE="${DELUGE_BURST_TAILSCALE_RESTORE_ADVERTISE_EXIT_NODE:-${TAILSCALE_RESTORE_ADVERTISE_EXIT_NODE}}"
+}
+
+is_true() {
+  case "${1,,}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 require_commands() {
@@ -94,7 +128,7 @@ parse_args() {
   shift
 
   case "${COMMAND}" in
-    provision|teardown|restore-base|status) ;;
+    provision|teardown|repair-active|restore-base|status) ;;
     -h|--help)
       usage
       exit 0
@@ -131,9 +165,29 @@ parse_args() {
         SERVER_ID="${2:-}"
         shift 2
         ;;
+      --volume-id)
+        VOL_ID="${2:-}"
+        shift 2
+        ;;
       --yes|-y)
         ASSUME_YES=1
         shift
+        ;;
+      --tailscale-exit-node)
+        TAILSCALE_EXIT_NODE="${2:-}"
+        shift 2
+        ;;
+      --no-tailscale-exit-node)
+        TAILSCALE_EXIT_NODE=""
+        shift
+        ;;
+      --tailscale-allow-lan-access)
+        TAILSCALE_ALLOW_LAN_ACCESS="${2:-}"
+        shift 2
+        ;;
+      --tailscale-restore-advertise-exit-node)
+        TAILSCALE_RESTORE_ADVERTISE_EXIT_NODE="${2:-}"
+        shift 2
         ;;
       -h|--help)
         usage
@@ -156,6 +210,16 @@ validate_args() {
     [[ -n "${ZONE}" ]] || die "--zone cannot be empty"
     [[ -n "${NAME_PREFIX}" ]] || die "--name-prefix cannot be empty"
   fi
+
+  case "${TAILSCALE_ALLOW_LAN_ACCESS,,}" in
+    true|false|1|0|yes|no|on|off) ;;
+    *) die "--tailscale-allow-lan-access must be true or false" ;;
+  esac
+
+  case "${TAILSCALE_RESTORE_ADVERTISE_EXIT_NODE,,}" in
+    auto|true|false|1|0|yes|no|on|off) ;;
+    *) die "--tailscale-restore-advertise-exit-node must be auto, true, or false" ;;
+  esac
 }
 
 acquire_lock() {
@@ -178,9 +242,135 @@ python_json_value() {
   python3 -c 'import json, sys; data=json.load(sys.stdin); value=data.get(sys.argv[1], ""); print("" if value is None else value)' "${key}"
 }
 
+capture_tailscale_state() {
+  if [[ "${TAILSCALE_STATE_CAPTURED}" -eq 1 ]]; then
+    return 0
+  fi
+
+  TAILSCALE_STATE_CAPTURED=1
+  local prefs
+  prefs="$(tailscale debug prefs 2>/dev/null || true)"
+  if [[ -z "${prefs}" ]]; then
+    return 0
+  fi
+
+  local parsed
+  parsed="$(
+    printf '%s\n' "${prefs}" | python3 -c '
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("|0|false")
+    raise SystemExit(0)
+
+routes = data.get("AdvertiseRoutes") or []
+advertising = "1" if "0.0.0.0/0" in routes or "::/0" in routes else "0"
+exit_node = data.get("ExitNodeID") or data.get("ExitNodeIP") or data.get("ExitNode") or ""
+allow_lan = data.get("ExitNodeAllowLANAccess")
+if allow_lan is None:
+    allow_lan = data.get("AllowLANWhileUsingExitNode", False)
+print(f"{exit_node}|{advertising}|{str(bool(allow_lan)).lower()}")
+'
+  )"
+
+  IFS='|' read -r TAILSCALE_PREVIOUS_EXIT_NODE TAILSCALE_WAS_ADVERTISING_EXIT_NODE TAILSCALE_PREVIOUS_ALLOW_LAN_ACCESS <<<"${parsed}"
+  [[ -n "${TAILSCALE_WAS_ADVERTISING_EXIT_NODE}" ]] || TAILSCALE_WAS_ADVERTISING_EXIT_NODE=0
+  [[ -n "${TAILSCALE_PREVIOUS_ALLOW_LAN_ACCESS}" ]] || TAILSCALE_PREVIOUS_ALLOW_LAN_ACCESS="false"
+}
+
+enable_scaleway_egress() {
+  if [[ -z "${TAILSCALE_EXIT_NODE}" || "${TAILSCALE_EGRESS_ACTIVE}" -eq 1 ]]; then
+    return 0
+  fi
+
+  require_commands tailscale
+  capture_tailscale_state
+
+  log "Temporarily using Tailscale exit node ${TAILSCALE_EXIT_NODE} for Scaleway API calls"
+  tailscale set --advertise-exit-node=false
+  TAILSCALE_EGRESS_ACTIVE=1
+
+  local allow_lan="false"
+  if is_true "${TAILSCALE_ALLOW_LAN_ACCESS}"; then
+    allow_lan="true"
+  fi
+  tailscale set --exit-node="${TAILSCALE_EXIT_NODE}" --exit-node-allow-lan-access="${allow_lan}"
+
+  if have curl; then
+    for _ in {1..10}; do
+      if curl -4 -sS --connect-timeout 2 --max-time 5 -o /dev/null https://api.scaleway.com >/dev/null 2>&1; then
+        return 0
+      fi
+      sleep 1
+    done
+    log "WARN: IPv4 check to api.scaleway.com did not pass yet; continuing and letting scw report the exact error"
+  fi
+}
+
+restore_scaleway_egress() {
+  if [[ "${TAILSCALE_EGRESS_ACTIVE}" -ne 1 ]]; then
+    return 0
+  fi
+
+  TAILSCALE_EGRESS_ACTIVE=0
+  log "Restoring Tailscale exit-node state"
+
+  if [[ -n "${TAILSCALE_PREVIOUS_EXIT_NODE}" && "${TAILSCALE_PREVIOUS_EXIT_NODE}" != "0" ]]; then
+    tailscale set --exit-node="${TAILSCALE_PREVIOUS_EXIT_NODE}" --exit-node-allow-lan-access="${TAILSCALE_PREVIOUS_ALLOW_LAN_ACCESS}" || true
+    return 0
+  fi
+
+  tailscale set --exit-node= || true
+
+  local restore_advertise=0
+  case "${TAILSCALE_RESTORE_ADVERTISE_EXIT_NODE,,}" in
+    auto)
+      [[ "${TAILSCALE_WAS_ADVERTISING_EXIT_NODE}" == "1" ]] && restore_advertise=1
+      ;;
+    true|1|yes|on)
+      restore_advertise=1
+      ;;
+  esac
+
+  if [[ "${restore_advertise}" -eq 1 ]]; then
+    tailscale set --advertise-exit-node=true || true
+  fi
+}
+
+scw_json() {
+  local description="$1"
+  shift
+
+  local output
+  if ! output="$("$@" -o json 2>&1)"; then
+    printf '%s\n' "${output}" >&2
+    die "Scaleway API call failed while ${description}. If this host is IPv6-only, provide IPv4 egress with a Tailscale exit node/NAT64 or run the Scaleway control-plane step from an IPv4-capable helper."
+  fi
+
+  if ! printf '%s\n' "${output}" | python3 -m json.tool >/dev/null 2>&1; then
+    printf '%s\n' "${output}" >&2
+    die "Scaleway API call returned non-JSON output while ${description}"
+  fi
+
+  printf '%s\n' "${output}"
+}
+
 metadata_value() {
   local key="$1"
-  curl -fsS --connect-timeout 1 http://169.254.42.42/conf?format=json 2>/dev/null \
+  local metadata_json=""
+
+  if have curl; then
+    metadata_json="$(curl -g -6 -fsS --connect-timeout 1 --max-time 3 "http://[fd00:42::42]/conf?format=json" 2>/dev/null || true)"
+    if [[ -z "${metadata_json}" ]]; then
+      metadata_json="$(curl -4 -fsS --connect-timeout 1 --max-time 3 --local-port 1-1023 "http://169.254.42.42/conf?format=json" 2>/dev/null || true)"
+    fi
+  fi
+
+  [[ -n "${metadata_json}" ]] || return 0
+  printf '%s\n' "${metadata_json}" \
     | python3 -c 'import json, sys; data=json.load(sys.stdin); print(data.get(sys.argv[1], "") or "")' "${key}" 2>/dev/null || true
 }
 
@@ -198,14 +388,64 @@ detect_server_id_and_zone() {
 
   if [[ -z "${SERVER_ID}" ]]; then
     local host_name
+    local servers_json
     host_name="$(hostname)"
+    servers_json="$(scw_json "listing instances in ${ZONE}" scw instance server list zone="${ZONE}")"
     SERVER_ID="$(
-      scw instance server list zone="${ZONE}" -o json \
-        | python3 -c 'import json, sys; host=sys.argv[1]; print(next((s.get("id", "") for s in json.load(sys.stdin) if s.get("name") == host), ""))' "${host_name}"
+      printf '%s\n' "${servers_json}" | python3 -c '
+import json
+import sys
+
+host = sys.argv[1]
+short = host.split(".", 1)[0]
+candidates = {host, short, host.lower(), short.lower()}
+
+raw = json.load(sys.stdin)
+if isinstance(raw, list):
+    servers = raw
+elif isinstance(raw, dict):
+    servers = raw.get("servers") or raw.get("Servers") or raw.get("items") or []
+else:
+    servers = []
+
+for server in servers:
+    if not isinstance(server, dict):
+        continue
+    names = [
+        str(server.get("name") or ""),
+        str(server.get("hostname") or ""),
+    ]
+    if any(name in candidates or name.lower() in candidates for name in names if name):
+        print(server.get("id", "") or "")
+        raise SystemExit(0)
+
+print("")
+' "${host_name}"
     )"
+    if [[ -z "${SERVER_ID}" ]]; then
+      printf 'Could not match hostname %s to a Scaleway instance in zone %s. Instances visible there:\n' "${host_name}" "${ZONE}" >&2
+      printf '%s\n' "${servers_json}" | python3 -c '
+import json
+import sys
+
+raw = json.load(sys.stdin)
+if isinstance(raw, list):
+    servers = raw
+elif isinstance(raw, dict):
+    servers = raw.get("servers") or raw.get("Servers") or raw.get("items") or []
+else:
+    servers = []
+
+for server in servers:
+    if isinstance(server, dict):
+        name = server.get("name", "<unnamed>")
+        server_id = server.get("id", "<no-id>")
+        print(f"  {name}  {server_id}", file=sys.stderr)
+' || true
+    fi
   fi
 
-  [[ -n "${SERVER_ID}" ]] || die "could not determine Scaleway server id; pass --server-id"
+  [[ -n "${SERVER_ID}" ]] || die "could not determine Scaleway server id; pass --server-id or set DELUGE_BURST_SERVER_ID in ${CONFIG_FILE}"
 }
 
 state_quote() {
@@ -395,6 +635,22 @@ restore_base_paths() {
   update_deluge_paths "${DOWNLOAD_DIR}" "${FINISHED_DIR}"
 }
 
+repair_active() {
+  [[ -d "${BURST_MOUNT}" ]] || die "burst mount path ${BURST_MOUNT} does not exist"
+  mountpoint -q "${BURST_MOUNT}" || die "${BURST_MOUNT} is not mounted"
+
+  install -d -m 750 "${BURST_COMPLETED}" "${BURST_INCOMPLETE}" "${BURST_BIND_TARGET}"
+  chown -R "${DELUGE_USER_SYS}:${DELUGE_USER_SYS}" "${BURST_MOUNT}" "${BURST_BIND_TARGET}" 2>/dev/null || true
+
+  if ! mountpoint -q "${BURST_BIND_TARGET}"; then
+    log "Binding completed burst downloads into ${BURST_BIND_TARGET}"
+    mount --bind "${BURST_COMPLETED}" "${BURST_BIND_TARGET}"
+  fi
+
+  update_deluge_paths "${BURST_INCOMPLETE}" "${BURST_COMPLETED}"
+  status
+}
+
 path_has_entries_other_than_markers() {
   local dir="$1"
   [[ -d "${dir}" ]] || return 1
@@ -417,6 +673,7 @@ find_volume_id_from_mount() {
   local source="$1"
   local real=""
   local serial=""
+  local pkname=""
 
   [[ -n "${source}" ]] || return 1
   real="$(readlink -f "${source}" 2>/dev/null || true)"
@@ -424,9 +681,21 @@ find_volume_id_from_mount() {
 
   serial="$(lsblk -no SERIAL "${real}" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
   if [[ -z "${serial}" ]]; then
+    pkname="$(lsblk -no PKNAME "${real}" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+    if [[ -n "${pkname}" ]]; then
+      serial="$(lsblk -no SERIAL "/dev/${pkname}" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+    fi
+  fi
+  if [[ -z "${serial}" ]]; then
     serial="$(
       lsblk -rno NAME,SERIAL 2>/dev/null \
-        | awk -v name="$(basename "${real}")" '$1 == name { print $2; exit }'
+        | awk -v name="$(basename "${real}")" -v pk="${pkname}" '($1 == name || (pk != "" && $1 == pk)) { print $2; exit }'
+    )"
+  fi
+  if [[ -z "${serial}" ]]; then
+    serial="$(
+      udevadm info --query=property --name="${real}" 2>/dev/null \
+        | awk -F= '/^(ID_SERIAL|ID_SERIAL_SHORT)=/ { print $2; exit }'
     )"
   fi
 
@@ -439,6 +708,7 @@ provision() {
   require_commands scw python3 lsblk blkid mount mountpoint systemctl flock awk readlink
   ensure_not_active
   ensure_base_dirs
+  enable_scaleway_egress
   detect_server_id_and_zone
 
   local volume_name="${NAME_PREFIX}-$(hostname)-$(date +%Y%m%d%H%M%S)"
@@ -446,7 +716,7 @@ provision() {
 
   log "Creating ${SIZE_GB}G Scaleway volume ${volume_name} in ${ZONE} with ${IOPS} IOPS"
   local volume_json volume_id
-  volume_json="$(scw block volume create name="${volume_name}" from-empty.size="${SIZE_GB}G" perf-iops="${IOPS}" zone="${ZONE}" -o json)"
+  volume_json="$(scw_json "creating burst block volume" scw block volume create name="${volume_name}" from-empty.size="${SIZE_GB}G" perf-iops="${IOPS}" zone="${ZONE}")"
   volume_id="$(printf '%s\n' "${volume_json}" | python_json_value id)"
   [[ -n "${volume_id}" ]] || die "Scaleway did not return a volume id"
 
@@ -456,6 +726,7 @@ provision() {
   log "Attaching volume ${volume_id} to server ${SERVER_ID}"
   scw instance server attach-volume server-id="${SERVER_ID}" volume-id="${volume_id}" volume-type=sbs_volume zone="${ZONE}" >/dev/null
   scw block volume wait "${volume_id}" zone="${ZONE}" terminal-status=in_use >/dev/null
+  restore_scaleway_egress
 
   log "Resolving local block device for ${volume_id}"
   local dev_path
@@ -477,7 +748,7 @@ provision() {
   : > "${BURST_MARKER}"
   chown "${DELUGE_USER_SYS}:${DELUGE_USER_SYS}" "${BURST_MARKER}" 2>/dev/null || true
 
-  update_deluge_paths "${BURST_INCOMPLETE}" "${BURST_BIND_TARGET}"
+  update_deluge_paths "${BURST_INCOMPLETE}" "${BURST_COMPLETED}"
   write_state "${volume_id}" "${dev_path}" "${volume_name}"
 
   cat <<EOF
@@ -487,14 +758,14 @@ OK: Deluge burst mode is active.
 Volume:      ${volume_id} (${SIZE_GB}G, ${IOPS} IOPS, ${ZONE})
 Mounted at:  ${BURST_MOUNT}
 Incomplete:  ${BURST_INCOMPLETE}
-Completed:   ${BURST_BIND_TARGET}
-Rsync path:  finished/_overflow
+Completed:   ${BURST_COMPLETED}
+Rsync path:  finished/_overflow -> ${BURST_COMPLETED}
 State file:  ${BURST_STATE_FILE}
 EOF
 }
 
 teardown() {
-  require_commands scw python3 lsblk findmnt mountpoint umount systemctl awk readlink
+  require_commands scw python3 lsblk findmnt mountpoint umount systemctl awk readlink udevadm
   load_state
 
   local source_before=""
@@ -518,7 +789,10 @@ teardown() {
   mountpoint -q "${BURST_MOUNT}" && umount "${BURST_MOUNT}" || true
 
   if [[ -z "${SERVER_ID:-}" ]]; then
+    enable_scaleway_egress
     detect_server_id_and_zone
+  else
+    enable_scaleway_egress
   fi
 
   log "Detaching volume ${VOL_ID} from server ${SERVER_ID}"
@@ -527,6 +801,7 @@ teardown() {
 
   log "Deleting volume ${VOL_ID}"
   scw block volume delete "${VOL_ID}" zone="${ZONE}" >/dev/null
+  restore_scaleway_egress
 
   rm -f "${BURST_MARKER}" 2>/dev/null || true
   rmdir "${BURST_BIND_TARGET}" 2>/dev/null || true
@@ -590,10 +865,12 @@ status() {
 }
 
 main() {
+  load_config
   parse_args "$@"
   validate_args
   require_root
   acquire_lock
+  trap restore_scaleway_egress EXIT
 
   case "${COMMAND}" in
     provision)
@@ -601,6 +878,9 @@ main() {
       ;;
     teardown)
       teardown
+      ;;
+    repair-active)
+      repair_active
       ;;
     restore-base)
       restore_base_paths
